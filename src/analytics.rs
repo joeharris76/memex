@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 
@@ -186,6 +186,13 @@ impl AnalyticsStore {
         if previous_schema_version != Some(SCHEMA_VERSION) {
             self.conn
                 .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
+            // Labels generated before the system-tag stripper was complete contained raw
+            // <system-reminder> / <command-message> wrappers. Clear them so the next
+            // backfill recomputes the real first user prompt.
+            let _ = self.conn.execute(
+                "UPDATE sessions SET label = NULL WHERE label LIKE '%<system-reminder>%' OR label LIKE '%<command-message>%' OR label LIKE '%<command-name>%'",
+                [],
+            );
         }
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -799,6 +806,7 @@ impl AnalyticsWriter {
         if entry.first_user_text.is_none()
             && record.role == "user"
             && !record.text.trim().is_empty()
+            && !sanitize_label(&record.text).is_empty()
         {
             entry.first_user_text = Some(record.text.clone());
         }
@@ -1251,30 +1259,38 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 }
 
 pub fn sanitize_label(raw: &str) -> String {
-    // Strip <system-reminder> blocks (case-insensitive).
-    let mut without_reminder = String::with_capacity(raw.len());
-    let lower = raw.to_lowercase();
-    let mut idx = 0;
-    while idx < raw.len() {
-        if let Some(start) = lower[idx..].find("<system-reminder") {
-            let abs_start = idx + start;
-            without_reminder.push_str(&raw[idx..abs_start]);
-            if let Some(end) = lower[abs_start..].find("</system-reminder>") {
-                idx = abs_start + end + "</system-reminder>".len();
-                continue;
+    // Strip system-like tag blocks (case-insensitive) that wrap slash-command / reminder metadata.
+    let mut current = raw.to_string();
+    for tag in [
+        "system-reminder",
+        "command-message",
+        "command-name",
+        "local-command-stdout",
+    ] {
+        let open = format!("<{tag}");
+        let close = format!("</{tag}>");
+        let lower = current.to_lowercase();
+        let mut without = String::with_capacity(current.len());
+        let mut idx = 0;
+        while idx < current.len() {
+            if let Some(start) = lower[idx..].find(&open) {
+                let abs_start = idx + start;
+                without.push_str(&current[idx..abs_start]);
+                if let Some(end) = lower[abs_start..].find(&close) {
+                    idx = abs_start + end + close.len();
+                    continue;
+                } else {
+                    // Tag opened but not closed – drop the rest.
+                    break;
+                }
             } else {
+                without.push_str(&current[idx..]);
                 break;
             }
-        } else {
-            without_reminder.push_str(&raw[idx..]);
-            break;
         }
+        current = without;
     }
-    let stripped = if without_reminder.is_empty() {
-        raw.to_string()
-    } else {
-        without_reminder
-    };
+    let stripped = current;
     let ansi_stripped = strip_ansi(&stripped);
     let collapsed = ansi_stripped
         .split_whitespace()
@@ -1442,6 +1458,10 @@ fn jcode_label_from_file(path: &str) -> Option<String> {
         }
         let combined = texts.join("\n");
         if combined.trim().is_empty() {
+            continue;
+        }
+        // Skip pure <system-reminder> messages – look for next user message.
+        if sanitize_label(&combined).is_empty() {
             continue;
         }
         return Some(combined);
