@@ -1637,8 +1637,8 @@ impl App {
                 options
             }
             HomeDropdown::Kind => vec![
-                "primary".to_string(),
                 "all".to_string(),
+                "primary".to_string(),
                 "subagent".to_string(),
             ],
             HomeDropdown::Project => {
@@ -1672,8 +1672,8 @@ impl App {
                 .map(|idx| idx + 1)
                 .unwrap_or(0),
             HomeDropdown::Kind => match self.session_kind {
-                crate::analytics::SessionKindFilter::Primary => 0,
-                crate::analytics::SessionKindFilter::All => 1,
+                crate::analytics::SessionKindFilter::All => 0,
+                crate::analytics::SessionKindFilter::Primary => 1,
                 crate::analytics::SessionKindFilter::Subagent => 2,
             },
             HomeDropdown::Project => self
@@ -1746,8 +1746,8 @@ impl App {
             }
             HomeDropdown::Kind => {
                 self.session_kind = match idx {
-                    0 => crate::analytics::SessionKindFilter::Primary,
-                    1 => crate::analytics::SessionKindFilter::All,
+                    0 => crate::analytics::SessionKindFilter::All,
+                    1 => crate::analytics::SessionKindFilter::Primary,
                     2 => crate::analytics::SessionKindFilter::Subagent,
                     _ => crate::analytics::SessionKindFilter::Primary,
                 };
@@ -3629,8 +3629,8 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
     frame.render_widget(Block::default().style(theme.panel_alt), popup);
     let items: Vec<ListItem> = if app.home_dropdown == HomeDropdown::Kind {
         let kind_items = [
-            ("primary", "primary interactive sessions"),
             ("all", "all sessions"),
+            ("primary", "primary interactive sessions"),
             ("subagent", "subagent sessions only"),
         ];
         kind_items
@@ -7822,15 +7822,26 @@ mod tests {
     #[test]
     fn kind_dropdown_applies_selection() {
         let (_tmp, mut app) = test_app();
+        // Default filter is primary, which sits at index 1 in all/primary/subagent order.
         app.open_home_dropdown(HomeDropdown::Kind);
-        assert_eq!(app.home_dropdown_state.selected(), Some(0));
-        app.move_home_dropdown_selection(2);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        app.move_home_dropdown_selection(1);
         app.apply_home_dropdown();
         assert_eq!(
             app.session_kind,
             crate::analytics::SessionKindFilter::Subagent
         );
         assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_lists_all_first() {
+        let (_tmp, mut app) = test_app();
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(
+            app.home_dropdown_options(),
+            vec!["all", "primary", "subagent"]
+        );
     }
 
     #[cfg(unix)]
@@ -7843,17 +7854,18 @@ mod tests {
             .expect("devnull");
         let mut terminal = Terminal::new(CrosstermBackend::new(devnull)).expect("terminal");
         app.open_home_dropdown(HomeDropdown::Kind);
-        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        // Default filter is primary at index 1 in all/primary/subagent order.
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
         // `j` moves down like in every other dropdown.
         let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty());
         handle_home_key(key, &mut terminal, &mut app).expect("key");
         assert_eq!(app.home_dropdown, HomeDropdown::Kind);
-        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        assert_eq!(app.home_dropdown_state.selected(), Some(2));
         // `k` moves back up and leaves the dropdown open.
         let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty());
         handle_home_key(key, &mut terminal, &mut app).expect("key");
         assert_eq!(app.home_dropdown, HomeDropdown::Kind);
-        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
         // `c` toggles the kind dropdown closed.
         let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
         handle_home_key(key, &mut terminal, &mut app).expect("key");
