@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 5;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 
@@ -187,10 +187,21 @@ impl AnalyticsStore {
             self.conn
                 .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
             // Labels generated before the system-tag stripper was complete contained raw
-            // <system-reminder> / <command-message> wrappers. Clear them so the next
-            // backfill recomputes the real first user prompt.
+            // system wrappers and truncated prefixes. Clear them so the next backfill
+            // recomputes with comprehensive stripping and suffix-preserving truncation.
             let _ = self.conn.execute(
-                "UPDATE sessions SET label = NULL WHERE label LIKE '%<system-reminder>%' OR label LIKE '%<command-message>%' OR label LIKE '%<command-name>%'",
+                "UPDATE sessions SET label = NULL WHERE \
+                 label LIKE '%<system-reminder>%' OR \
+                 label LIKE '%<command-message>%' OR \
+                 label LIKE '%<command-name>%' OR \
+                 label LIKE '%<INSTRUCTIONS>%' OR \
+                 label LIKE '%<environment_context>%' OR \
+                 label LIKE '%<recommended_plugins>%' OR \
+                 label LIKE '%<user_instructions>%' OR \
+                 label LIKE '%<skill>%' OR \
+                 label LIKE '%<%' OR \
+                 label LIKE '# AGENTS.md%' OR \
+                 label LIKE 'You are a reminder observer%'",
                 [],
             );
         }
@@ -1258,46 +1269,100 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
     workspace
 }
 
+#[allow(clippy::while_let_loop)]
 pub fn sanitize_label(raw: &str) -> String {
-    // Strip system-like tag blocks (case-insensitive) that wrap slash-command / reminder metadata.
+    // Comprehensive stripping of system wrappers (case-insensitive).
     let mut current = raw.to_string();
-    for tag in [
+    const DROP_TAGS: &[&str] = &[
         "system-reminder",
         "command-message",
         "command-name",
         "local-command-stdout",
-    ] {
-        let open = format!("<{tag}");
-        let close = format!("</{tag}>");
-        let lower = current.to_lowercase();
-        let mut without = String::with_capacity(current.len());
-        let mut idx = 0;
-        while idx < current.len() {
-            if let Some(start) = lower[idx..].find(&open) {
-                let abs_start = idx + start;
-                without.push_str(&current[idx..abs_start]);
-                if let Some(end) = lower[abs_start..].find(&close) {
-                    idx = abs_start + end + close.len();
-                    continue;
-                } else {
-                    // Tag opened but not closed – drop the rest.
+        "local-command-caveat",
+        "local-command-output",
+        "instructions",
+        "environment_context",
+        "cwd",
+        "approval_policy",
+        "shell",
+        "user_instructions",
+        "recommended_plugins",
+        "skill",
+        "user_action",
+        "context",
+        "task-notification",
+        "task-id",
+        "tool-use-id",
+        "subagent_notification",
+        "turn_aborted",
+        "current_date",
+        "timezone",
+        "epoch",
+        "collaboration_mode",
+        "apps_instructions",
+        "permissions",
+        "total_tokens",
+    ];
+    for tag in DROP_TAGS {
+        let open = format!("<{}", tag.to_lowercase());
+        let close = format!("</{}>", tag.to_lowercase());
+        loop {
+            let lower = current.to_lowercase();
+            let Some(start) = lower.find(&open) else {
+                break;
+            };
+            let open_end = match lower[start..].find('>') {
+                Some(p) => start + p + 1,
+                None => {
+                    current.truncate(start);
                     break;
                 }
+            };
+            if let Some(end_offset) = lower[open_end..].find(&close) {
+                let abs_end = open_end + end_offset + close.len();
+                current.replace_range(start..abs_end, " ");
             } else {
-                without.push_str(&current[idx..]);
+                current.truncate(start);
                 break;
             }
         }
-        current = without;
     }
-    let stripped = current;
-    let ansi_stripped = strip_ansi(&stripped);
+    // Generic unwrap: remove any remaining <...> tags but keep inner text.
+    let mut search_start = 0;
+    loop {
+        let Some(rel_start) = current[search_start..].find('<') else {
+            break;
+        };
+        let start = search_start + rel_start;
+        let Some(end) = current[start..].find('>') else {
+            break;
+        };
+        let abs_end = start + end + 1;
+        let after_lt = current[start + 1..].chars().next().unwrap_or(' ');
+        if after_lt.is_ascii_alphabetic() || after_lt == '/' || after_lt == '!' {
+            current.replace_range(start..abs_end, " ");
+            search_start = start;
+        } else {
+            search_start = abs_end;
+        }
+        if current.len() > 10000 {
+            break;
+        }
+    }
+    let ansi_stripped = strip_ansi(&current);
     let collapsed = ansi_stripped
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ");
     let trimmed = collapsed.trim();
     if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("# agents.md")
+        || lower.contains("global agent preferences")
+        || lower.starts_with("you are a reminder observer")
+    {
         return String::new();
     }
     // Remove non-printable control chars
@@ -1312,17 +1377,42 @@ pub fn sanitize_label(raw: &str) -> String {
     if printable.chars().count() <= MAX_LABEL_CHARS {
         return printable.to_string();
     }
-    let truncated: String = printable.chars().take(MAX_LABEL_CHARS - 1).collect();
-    if let Some(pos) = truncated.rfind(' ')
-        && pos > 80
-    {
-        let mut out: String = printable.chars().take(pos).collect();
+    // Suffix-preserving truncation: keep head and tail to preserve distinguishing suffix.
+    const TAIL_LEN: usize = 40;
+    let head_len = MAX_LABEL_CHARS.saturating_sub(TAIL_LEN + 1);
+    let head_raw: String = printable.chars().take(head_len).collect();
+    let head = if let Some(pos) = head_raw.rfind(' ') {
+        if pos > 80 {
+            head_raw[..pos].to_string()
+        } else {
+            head_raw
+        }
+    } else {
+        head_raw
+    };
+    let rev_tail: String = printable.chars().rev().take(TAIL_LEN).collect();
+    let tail_raw: String = rev_tail.chars().rev().collect();
+    let tail = if let Some(pos) = tail_raw.find(' ') {
+        tail_raw[pos + 1..].trim().to_string()
+    } else {
+        tail_raw.trim().to_string()
+    };
+    if tail.is_empty() {
+        let mut out = head;
         out.push('…');
         return out;
     }
-    let mut out = truncated;
-    out.push('…');
-    out
+    let mut tail = tail;
+    while head.chars().count() + 1 + tail.chars().count() > MAX_LABEL_CHARS {
+        if let Some(pos) = tail.find(' ') {
+            tail = tail[pos + 1..].trim().to_string();
+        } else if tail.chars().count() > 10 {
+            tail = tail.chars().skip(tail.chars().count() - 10).collect();
+        } else {
+            break;
+        }
+    }
+    format!("{}…{}", head, tail)
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -2146,8 +2236,8 @@ mod tests {
 
     #[test]
     fn jcode_tmp_cwd_is_classified_as_subagent() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let transcript = tmp.path().join("session_session_tmp.json");
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let _transcript = _tmp.path().join("session_session_tmp.json");
         // Need a file that contains cwd; but we also need to test inference via cwd.
         // We'll directly test infer_session_kind helper.
         let kind = infer_session_kind(
