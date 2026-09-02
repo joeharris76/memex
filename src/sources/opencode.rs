@@ -286,10 +286,7 @@ fn session_agents(connection: &Connection) -> HashMap<String, String> {
         return agents;
     };
     let Ok(rows) = statement.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-        ))
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
     }) else {
         return agents;
     };

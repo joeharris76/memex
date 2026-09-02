@@ -1272,81 +1272,85 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 #[allow(clippy::while_let_loop)]
 pub fn sanitize_label(raw: &str) -> String {
     // Comprehensive stripping of system wrappers (case-insensitive).
+    // Fast path: neither the tag stripper nor the generic unwrap can match
+    // without a '<', so skip both scans for ordinary prose. This keeps the
+    // per-record emptiness check in `record` cheap during index scans.
     let mut current = raw.to_string();
-    const DROP_TAGS: &[&str] = &[
-        "system-reminder",
-        "command-message",
-        "command-name",
-        "local-command-stdout",
-        "local-command-caveat",
-        "local-command-output",
-        "instructions",
-        "environment_context",
-        "cwd",
-        "approval_policy",
-        "shell",
-        "user_instructions",
-        "recommended_plugins",
-        "skill",
-        "user_action",
-        "context",
-        "task-notification",
-        "task-id",
-        "tool-use-id",
-        "subagent_notification",
-        "turn_aborted",
-        "current_date",
-        "timezone",
-        "epoch",
-        "collaboration_mode",
-        "apps_instructions",
-        "permissions",
-        "total_tokens",
-    ];
-    for tag in DROP_TAGS {
-        let open = format!("<{}", tag.to_lowercase());
-        let close = format!("</{}>", tag.to_lowercase());
-        loop {
-            let lower = current.to_lowercase();
-            let Some(start) = lower.find(&open) else {
-                break;
-            };
-            let open_end = match lower[start..].find('>') {
-                Some(p) => start + p + 1,
-                None => {
+    if current.contains('<') {
+        const DROP_TAGS: &[&str] = &[
+            "system-reminder",
+            "command-message",
+            "command-name",
+            "local-command-stdout",
+            "local-command-caveat",
+            "local-command-output",
+            "instructions",
+            "environment_context",
+            "cwd",
+            "approval_policy",
+            "shell",
+            "user_instructions",
+            "recommended_plugins",
+            "skill",
+            "user_action",
+            "context",
+            "task-notification",
+            "task-id",
+            "tool-use-id",
+            "subagent_notification",
+            "turn_aborted",
+            "current_date",
+            "timezone",
+            "epoch",
+            "collaboration_mode",
+            "apps_instructions",
+            "permissions",
+            "total_tokens",
+        ];
+        for tag in DROP_TAGS {
+            let open = format!("<{tag}");
+            let close = format!("</{tag}>");
+            loop {
+                let Some(start) = find_ascii_ci(&current, &open) else {
+                    break;
+                };
+                let open_end = match current[start..].find('>') {
+                    Some(p) => start + p + 1,
+                    None => {
+                        current.truncate(start);
+                        break;
+                    }
+                };
+                if let Some(end_offset) = find_ascii_ci(&current[open_end..], &close) {
+                    let abs_end = open_end + end_offset + close.len();
+                    current.replace_range(start..abs_end, " ");
+                } else {
                     current.truncate(start);
                     break;
                 }
-            };
-            if let Some(end_offset) = lower[open_end..].find(&close) {
-                let abs_end = open_end + end_offset + close.len();
-                current.replace_range(start..abs_end, " ");
-            } else {
-                current.truncate(start);
-                break;
             }
         }
-    }
-    // Generic unwrap: remove any remaining <...> tags but keep inner text.
-    let mut search_start = 0;
-    loop {
-        let Some(rel_start) = current[search_start..].find('<') else {
-            break;
-        };
-        let start = search_start + rel_start;
-        let Some(end) = current[start..].find('>') else {
-            break;
-        };
-        let abs_end = start + end + 1;
-        let after_lt = current[start + 1..].chars().next().unwrap_or(' ');
-        if after_lt.is_ascii_alphabetic() || after_lt == '/' || after_lt == '!' {
-            current.replace_range(start..abs_end, " ");
-            search_start = start;
-        } else {
-            search_start = abs_end;
-        }
-        if current.len() > 10000 {
-            break;
+        // Generic unwrap: remove any remaining <...> tags but keep inner text.
+        let mut search_start = 0;
+        loop {
+            let Some(rel_start) = current[search_start..].find('<') else {
+                break;
+            };
+            let start = search_start + rel_start;
+            let Some(end) = current[start..].find('>') else {
+                break;
+            };
+            let abs_end = start + end + 1;
+            let after_lt = current[start + 1..].chars().next().unwrap_or(' ');
+            if after_lt.is_ascii_alphabetic() || after_lt == '/' || after_lt == '!' {
+                current.replace_range(start..abs_end, " ");
+                search_start = start;
+            } else {
+                search_start = abs_end;
+            }
+            if current.len() > 10000 {
+                break;
+            }
         }
     }
     let ansi_stripped = strip_ansi(&current);
@@ -1415,7 +1419,25 @@ pub fn sanitize_label(raw: &str) -> String {
     format!("{}…{}", head, tail)
 }
 
+/// ASCII case-insensitive substring search over the original string's bytes.
+/// Tag patterns are pure ASCII, so byte-wise matching keeps every index in the
+/// original string's coordinates: Unicode `to_lowercase` can shift byte
+/// offsets (e.g. U+0130 folds 2 bytes into 3), which would make `replace_range`
+/// or `truncate` panic on a non-char-boundary. Every match starts at a `<`
+/// byte, which is always a char boundary in UTF-8.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let hay = haystack.as_bytes();
+    let ndl = needle.as_bytes();
+    if ndl.is_empty() || hay.len() < ndl.len() {
+        return None;
+    }
+    (0..=hay.len() - ndl.len()).find(|&i| hay[i..i + ndl.len()].eq_ignore_ascii_case(ndl))
+}
+
 fn strip_ansi(input: &str) -> String {
+    if !input.contains('\x1b') {
+        return input.to_string();
+    }
     let mut out = String::with_capacity(input.len());
     let bytes = input.as_bytes();
     let mut i = 0;
@@ -1451,8 +1473,15 @@ fn strip_ansi(input: &str) -> String {
             i += 1;
             continue;
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy one full UTF-8 scalar value: pushing a single byte as char
+        // would corrupt multi-byte sequences (e.g. emoji) into mojibake and
+        // inflate char counts used by truncation. `i` always rests on a char
+        // boundary here because every skipped escape sequence is pure ASCII.
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        i += ch.len_utf8();
     }
     out
 }
@@ -2148,6 +2177,40 @@ mod tests {
         assert!(label.chars().count() <= MAX_LABEL_CHARS);
         assert!(label.ends_with('…') || label.chars().count() < MAX_LABEL_CHARS);
         assert!(label.starts_with("Hello world red"));
+    }
+
+    #[test]
+    fn strip_ansi_preserves_multibyte_unicode() {
+        let label = sanitize_label("Fix the 🚀 deploy \x1b[31mred\x1b[0m pipeline ✅ now");
+        assert_eq!(label, "Fix the 🚀 deploy red pipeline ✅ now");
+        assert!(label.contains('🚀'));
+    }
+
+    #[test]
+    fn sanitize_label_truncates_unicode_by_chars_not_bytes() {
+        let raw = "🚀".repeat(200);
+        let label = sanitize_label(&raw);
+        assert!(label.chars().count() <= MAX_LABEL_CHARS);
+        assert!(label.contains('…'));
+        assert!(label.starts_with("🚀"));
+    }
+
+    #[test]
+    fn sanitize_label_with_unicode_case_fold_before_tag_does_not_panic() {
+        // U+0130 folds to 2 chars on lowercase; byte offsets computed on the
+        // folded copy would be wrong for the original. Must strip safely.
+        let raw = "İstanbul \u{130} <SYSTEM-REMINDER>hidden</SYSTEM-REMINDER> visible task";
+        let label = sanitize_label(raw);
+        assert!(!label.contains("hidden"));
+        assert!(!label.contains("SYSTEM-REMINDER"));
+        assert!(label.contains("visible task"));
+    }
+
+    #[test]
+    fn sanitize_label_preserves_lone_comparison_brackets() {
+        let raw = "a < b and c > d comparison";
+        let label = sanitize_label(raw);
+        assert_eq!(label, "a < b and c > d comparison");
     }
 
     #[test]

@@ -4088,7 +4088,7 @@ fn session_result_line(
         ),
         Span::raw("  "),
     ];
-<    // Show label/title when there is no search snippet (recent/home view), badge subagents
+    // Show label/title when there is no search snippet (recent/home view), badge subagents
     let is_subagent = session
         .conversation_kind
         .as_deref()
@@ -7216,6 +7216,8 @@ mod tests {
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
         };
 
         let line = session_result_line(&session, &[], 8, 40, &Theme::new());
