@@ -128,6 +128,12 @@ Index (incremental):
 memex index
 ```
 
+Modern OpenCode sessions stored in `opencode*.db` under
+`~/.local/share/opencode` are discovered automatically, alongside OpenCode's
+legacy JSON storage. To use one or more alternate data roots, set
+`OPENCODE_DATA_DIR` to a comma-separated list of directories before running
+the installed `memex` binary.
+
 The default scan indexes Pi sessions from `~/.pi/agent/sessions` and Oh My Pi sessions
 separately from `~/.omp/agent/sessions` plus named profile session directories.
 

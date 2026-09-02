@@ -1,3 +1,4 @@
+use crate::state::SessionScope;
 use crate::types::{Record, SourceFilter, SourceKind};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
@@ -57,6 +58,7 @@ pub struct AnalyticsWriter {
     sessions: HashMap<SessionKey, SessionAccumulator>,
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
     git_cache: HashMap<String, GitMetadata>,
+    cwd_overrides: HashMap<SessionKey, String>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -212,6 +214,18 @@ impl AnalyticsStore {
         self.conn.execute(
             "DELETE FROM sessions WHERE source_path = ?1",
             params![source_path],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM sessions WHERE source = ?1 AND source_path = ?2 AND session_id = ?3",
+            params![
+                SourceKind::Opencode.storage_label(),
+                scope.source_path,
+                scope.session_id
+            ],
         )?;
         Ok(())
     }
@@ -632,6 +646,7 @@ impl AnalyticsWriter {
             sessions: HashMap::new(),
             metadata_cache: HashMap::new(),
             git_cache: HashMap::new(),
+            cwd_overrides: HashMap::new(),
         })
     }
 
@@ -641,6 +656,27 @@ impl AnalyticsWriter {
 
     pub fn delete_source_path(&self, source_path: &str) -> Result<()> {
         self.store.delete_source_path(source_path)
+    }
+
+    pub fn delete_session_scope(&self, scope: &SessionScope) -> Result<()> {
+        self.store.delete_session_scope(scope)
+    }
+
+    pub fn set_session_cwd(
+        &mut self,
+        source: SourceKind,
+        source_path: &str,
+        session_id: &str,
+        cwd: &str,
+    ) {
+        self.cwd_overrides.insert(
+            SessionKey {
+                source,
+                session_id: session_id.to_string(),
+                source_path: source_path.to_string(),
+            },
+            cwd.to_string(),
+        );
     }
 
     pub fn record(&mut self, record: &Record) -> Result<()> {
@@ -737,7 +773,9 @@ impl AnalyticsWriter {
     }
 
     fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
-        let cwd = resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id);
+        let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
+            resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
+        });
         let Some(cwd) = cwd else {
             return SessionMetadata {
                 resolution_status: "no-cwd".to_string(),
@@ -964,6 +1002,13 @@ fn resolve_session_cwd_from_parts(
     source_path: &str,
     session_id: &str,
 ) -> Option<String> {
+    if source == SourceKind::Opencode && crate::sources::opencode::is_database_path(source_path) {
+        return crate::sources::opencode::enumerate_sessions(Path::new(source_path))
+            .ok()?
+            .into_iter()
+            .find(|session| session.id == session_id)
+            .map(|session| session.directory);
+    }
     if source == SourceKind::Copilot
         && let Some(cwd) = resolve_copilot_workspace_cwd(source_path)
     {

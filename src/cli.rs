@@ -4961,34 +4961,59 @@ mod tests {
 
     #[test]
     fn web_ui_readiness_requires_memex_health_response() {
-        let (listen, server) = serve_one_test_response(
+        let server = serve_test_responses(
             "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
         );
 
-        wait_for_web_ui(&listen, Duration::from_secs(1)).unwrap();
-        server.join().unwrap();
+        wait_for_web_ui(&server.listen, Duration::from_secs(1)).unwrap();
+        server.shutdown();
     }
 
     #[test]
     fn web_ui_readiness_rejects_unrelated_tcp_listener() {
-        let (listen, server) = serve_one_test_response(
+        let server = serve_test_responses(
             "HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\nnope",
         );
 
-        assert!(!web_ui_is_healthy(&listen));
-        server.join().unwrap();
+        assert!(!web_ui_is_healthy(&server.listen));
+        server.shutdown();
     }
 
-    fn serve_one_test_response(response: &'static str) -> (String, std::thread::JoinHandle<()>) {
+    struct TestResponseServer {
+        listen: String,
+        shutdown: std::sync::mpsc::Sender<()>,
+        server: std::thread::JoinHandle<()>,
+    }
+
+    impl TestResponseServer {
+        fn shutdown(self) {
+            self.shutdown.send(()).unwrap();
+            TcpStream::connect(&self.listen).unwrap();
+            self.server.join().unwrap();
+        }
+    }
+
+    fn serve_test_responses(response: &'static str) -> TestResponseServer {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let listen = listener.local_addr().unwrap().to_string();
+        let (shutdown, shutdown_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            stream.write_all(response.as_bytes()).unwrap();
+            loop {
+                let (mut stream, _) = listener.accept().unwrap();
+                if shutdown_rx.try_recv().is_ok() {
+                    break;
+                }
+                let mut request = [0_u8; 1024];
+                if stream.read(&mut request).is_ok() {
+                    let _ = stream.write_all(response.as_bytes());
+                }
+            }
         });
-        (listen, server)
+        TestResponseServer {
+            listen,
+            shutdown,
+            server,
+        }
     }
 
     #[test]

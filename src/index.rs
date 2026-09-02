@@ -1,3 +1,4 @@
+use crate::state::SessionScope;
 use crate::types::{Record, RecordLinks, SourceFilter};
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
@@ -500,6 +501,46 @@ impl SearchIndex {
         writer.delete_term(term);
     }
 
+    pub fn doc_ids_by_source_scope(&self, scope: &SessionScope) -> Result<Vec<u64>> {
+        self.doc_ids_matching_query(Box::new(source_scope_query(&self.fields, scope)))
+    }
+
+    pub fn doc_ids_by_source_path(&self, path: &str) -> Result<Vec<u64>> {
+        let query = TermQuery::new(
+            Term::from_field_text(self.fields.source_path, path),
+            IndexRecordOption::Basic,
+        );
+        self.doc_ids_matching_query(Box::new(query))
+    }
+
+    fn doc_ids_matching_query(&self, query: Box<dyn Query>) -> Result<Vec<u64>> {
+        let reader = self.reader()?;
+        let searcher = reader.searcher();
+        let limit = (searcher.num_docs() as usize).max(1);
+        let top_docs = searcher.search(query.as_ref(), &TopDocs::with_limit(limit))?;
+        let mut doc_ids = Vec::with_capacity(top_docs.len());
+        for (_, address) in top_docs {
+            let doc = searcher.doc::<TantivyDocument>(address)?;
+            if let Some(doc_id) = doc
+                .get_first(self.fields.doc_id)
+                .and_then(|value| value.as_u64())
+            {
+                doc_ids.push(doc_id);
+            }
+        }
+        doc_ids.sort_unstable();
+        Ok(doc_ids)
+    }
+
+    pub fn delete_by_source_scope(
+        &self,
+        writer: &mut IndexWriter,
+        scope: &SessionScope,
+    ) -> Result<()> {
+        writer.delete_query(Box::new(source_scope_query(&self.fields, scope)))?;
+        Ok(())
+    }
+
     pub fn add_record(&self, writer: &mut IndexWriter, record: &Record) -> Result<()> {
         let mut doc = TantivyDocument::default();
         doc.add_u64(self.fields.doc_id, record.doc_id);
@@ -746,6 +787,25 @@ impl SearchIndex {
         }
         Ok(())
     }
+}
+
+fn source_scope_query(fields: &IndexFields, scope: &SessionScope) -> BooleanQuery {
+    BooleanQuery::new(vec![
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.source_path, &scope.source_path),
+                IndexRecordOption::Basic,
+            )),
+        ),
+        (
+            Occur::Must,
+            Box::new(TermQuery::new(
+                Term::from_field_text(fields.session_id, &scope.session_id),
+                IndexRecordOption::Basic,
+            )),
+        ),
+    ])
 }
 
 #[derive(Debug, Clone, Copy)]

@@ -340,6 +340,15 @@ impl VectorIndex {
         Ok(())
     }
 
+    pub(crate) fn remove_doc_ids(&mut self, doc_ids: &HashSet<u64>) -> Result<()> {
+        for doc_id in doc_ids {
+            if self.doc_id_set.remove(doc_id) {
+                self.index.remove(*doc_id)?;
+            }
+        }
+        Ok(())
+    }
+
     pub fn exists(dir: &Path) -> bool {
         dir.join(CURRENT_GENERATION_FILE).exists() || dir.join("usearch.index").exists()
     }

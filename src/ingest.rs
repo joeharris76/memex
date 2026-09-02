@@ -5,7 +5,7 @@ use crate::index::SearchIndex;
 use crate::lease::IngestLease;
 use crate::progress::{Progress, SOURCE_COUNT};
 use crate::state::{
-    FileIdentity, FileState, IngestState, PendingIngest, PendingToolCall, ScanCache,
+    FileIdentity, FileState, IngestState, PendingIngest, PendingToolCall, ScanCache, SessionScope,
 };
 #[cfg(test)]
 use crate::types::RecordLinks;
@@ -16,7 +16,7 @@ use rayon::prelude::*;
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
@@ -79,6 +79,51 @@ struct FileUpdate {
     state: FileState,
     session_id: Option<String>,
     diagnostics: crate::sources::ParseDiagnostics,
+}
+
+#[derive(Debug, Clone)]
+struct PlannedOpencodeDatabase {
+    path: PathBuf,
+    scan: crate::sources::opencode::DatabaseScan,
+}
+
+struct PreparedOpencodeDatabase {
+    path: PathBuf,
+    scan: crate::sources::opencode::DatabaseScan,
+    spool: tempfile::NamedTempFile,
+    diagnostics: crate::sources::ParseDiagnostics,
+}
+
+const OPENCODE_SPOOL_PREFIX: &str = ".memex-opencode-spool-";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpencodeDatabaseOutcome {
+    Planned,
+    Ready,
+    ConfirmedAbsent,
+    Failed,
+}
+
+fn classify_opencode_database_outcome(
+    outcome: Option<OpencodeDatabaseOutcome>,
+    discovered: bool,
+    inventory_completed: bool,
+) -> OpencodeDatabaseOutcome {
+    outcome.unwrap_or(if inventory_completed && !discovered {
+        OpencodeDatabaseOutcome::ConfirmedAbsent
+    } else {
+        OpencodeDatabaseOutcome::Failed
+    })
+}
+
+fn claim_opencode_session_owner(
+    owners: &mut HashMap<String, String>,
+    session_id: String,
+    database_path: &str,
+) {
+    owners
+        .entry(session_id)
+        .or_insert_with(|| database_path.to_string());
 }
 
 const FILE_IDENTITY_PREFIX_BYTES: usize = 4096;
@@ -320,6 +365,95 @@ impl RecordSender {
     }
 }
 
+fn prehydrate_opencode_database(
+    path: &Path,
+    scan: &crate::sources::opencode::DatabaseScan,
+    session_ids: &[String],
+    next_doc_id: &AtomicU64,
+    state_dir: &Path,
+) -> Result<PreparedOpencodeDatabase> {
+    let mut spool = tempfile::Builder::new()
+        .prefix(OPENCODE_SPOOL_PREFIX)
+        .tempfile_in(state_dir)
+        .with_context(|| format!("create OpenCode hydration spool in {}", state_dir.display()))?;
+    let mut diagnostics = crate::sources::ParseDiagnostics::default();
+    for session_id in session_ids {
+        let output = crate::sources::opencode::parse_database_records(
+            path,
+            session_id,
+            crate::sources::IndexParseState::default(),
+            next_doc_id,
+            |record| {
+                serde_json::to_writer(spool.as_file_mut(), &record)?;
+                spool.as_file_mut().write_all(b"\n")?;
+                Ok(())
+            },
+        )
+        .with_context(|| {
+            format!(
+                "hydrate OpenCode session `{session_id}` from {}",
+                path.display()
+            )
+        })?;
+        diagnostics.merge(output.diagnostics);
+    }
+    spool.as_file_mut().flush()?;
+    Ok(PreparedOpencodeDatabase {
+        path: path.to_path_buf(),
+        scan: scan.clone(),
+        spool,
+        diagnostics,
+    })
+}
+
+fn cleanup_opencode_spools(state_dir: &Path) -> Result<()> {
+    let entries = match std::fs::read_dir(state_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(OPENCODE_SPOOL_PREFIX)
+            && entry.file_type()?.is_file()
+        {
+            std::fs::remove_file(entry.path())?;
+        }
+    }
+    Ok(())
+}
+
+fn replay_opencode_spool(
+    spool: &mut tempfile::NamedTempFile,
+    tx_record: &RecordSender,
+    database_path: &Path,
+    owned_session_ids: &HashSet<String>,
+) -> Result<()> {
+    spool.as_file_mut().seek(SeekFrom::Start(0))?;
+    let reader = BufReader::new(spool.as_file_mut());
+    for line in reader.lines() {
+        let line = line.with_context(|| {
+            format!(
+                "read OpenCode hydration spool for {}",
+                database_path.display()
+            )
+        })?;
+        let record = serde_json::from_str::<Record>(&line).with_context(|| {
+            format!(
+                "decode OpenCode hydration spool for {}",
+                database_path.display()
+            )
+        })?;
+        if owned_session_ids.contains(&record.session_id) {
+            tx_record.send(record)?;
+        }
+    }
+    Ok(())
+}
+
 struct WriterContext {
     embeddings: bool,
     do_backfill_embeddings: bool,
@@ -331,6 +465,9 @@ struct WriterContext {
     embed_runtime: EmbedRuntimeConfig,
     tool_content_limits: IndexedToolContentLimits,
     reconcile_vector_ids: bool,
+    scope_targets: Vec<SessionScope>,
+    opencode_session_cwds: HashMap<SessionScope, String>,
+    vector_delete_paths: HashSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -459,6 +596,41 @@ fn pending_ingest_path(paths: &Paths) -> PathBuf {
     paths.state.join("ingest.pending.json")
 }
 
+fn finalize_pending_ingest(
+    pending_path: &Path,
+    deferred_scopes: &[SessionScope],
+    next_doc_id: u64,
+) -> Result<()> {
+    if deferred_scopes.is_empty() {
+        return PendingIngest::clear(pending_path);
+    }
+    PendingIngest {
+        next_doc_id,
+        source_paths: Vec::new(),
+        session_scopes: deferred_scopes.to_vec(),
+        vector_publication: false,
+    }
+    .save(pending_path)
+}
+
+fn pending_scope_union(
+    active_scopes: &[SessionScope],
+    deferred_scopes: &[SessionScope],
+) -> Vec<SessionScope> {
+    let mut scopes = active_scopes
+        .iter()
+        .chain(deferred_scopes)
+        .cloned()
+        .collect::<Vec<_>>();
+    scopes.sort_by(|left, right| {
+        left.source_path
+            .cmp(&right.source_path)
+            .then_with(|| left.session_id.cmp(&right.session_id))
+    });
+    scopes.dedup();
+    scopes
+}
+
 fn prepare_pending_ingest_recovery(
     paths: &Paths,
     state: &mut IngestState,
@@ -472,6 +644,9 @@ fn prepare_pending_ingest_recovery(
 
     for source_path in &pending.source_paths {
         state.files.remove(source_path);
+        if crate::sources::opencode::is_database_path(source_path) {
+            state.opencode_databases.remove(source_path);
+        }
     }
     state.next_doc_id = state.next_doc_id.max(pending.next_doc_id);
     Ok(Some(pending))
@@ -489,8 +664,17 @@ pub fn ingest_all(
     let mut state = IngestState::load(&state_path)?;
     let pending_recovery = prepare_pending_ingest_recovery(paths, &mut state)?;
     let recovering_pending_ingest = pending_recovery.is_some();
-    if index.doc_count()? == 0 && !state.files.is_empty() {
+    let mut deferred_pending_scopes = pending_recovery
+        .as_ref()
+        .map(|pending| pending.session_scopes.clone())
+        .unwrap_or_default();
+    cleanup_opencode_spools(&paths.state)?;
+    let mut empty_index_rebuild = false;
+    if index.doc_count()? == 0 && (!state.files.is_empty() || !state.opencode_databases.is_empty())
+    {
+        empty_index_rebuild = true;
         state.files.clear();
+        state.opencode_databases.clear();
         if paths.vectors.exists() {
             std::fs::remove_dir_all(&paths.vectors)?;
             std::fs::create_dir_all(&paths.vectors)?;
@@ -515,6 +699,16 @@ pub fn ingest_all(
     let mut files_scanned = 0usize;
     let mut files_skipped = 0usize;
     let mut total_bytes = 0u64;
+    let mut opencode_ready_databases = Vec::new();
+    let mut opencode_ready_owned_sessions = HashMap::new();
+    let mut opencode_diagnostics = crate::sources::ParseDiagnostics::default();
+    let mut opencode_scope_targets = Vec::new();
+    let mut opencode_session_cwds = HashMap::new();
+    let mut opencode_database_states = HashMap::new();
+    let mut opencode_database_paths_to_delete = Vec::new();
+    let mut opencode_database_outcomes = HashMap::new();
+    let mut opencode_discovered_database_paths = HashSet::new();
+    let mut opencode_legacy_paths_to_delete = Vec::new();
 
     for claude_source in &options.claude_sources {
         if !claude_source.exists() {
@@ -612,10 +806,214 @@ pub fn ingest_all(
     }
 
     if options.include_opencode {
+        let database_files = crate::sources::opencode::discover_databases()?;
+        let mut planned_databases = Vec::new();
+        for source_file in database_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let key = path.to_string_lossy().to_string();
+            opencode_discovered_database_paths.insert(key.clone());
+            let Some(meta) = (match discovered_metadata(&path) {
+                Ok(meta) => meta,
+                Err(_) => {
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                    continue;
+                }
+            }) else {
+                opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let previous = state.opencode_databases.get(&key);
+            match crate::sources::opencode::scan_database(&path, previous) {
+                Ok(scan) => {
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Planned);
+                    planned_databases.push(PlannedOpencodeDatabase { path, scan });
+                }
+                Err(_) => {
+                    // A bad/locked modern database must not hide the compatible JSON store.
+                    opencode_database_outcomes.insert(key, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                }
+            }
+        }
+        planned_databases.sort_by(|left, right| left.path.cmp(&right.path));
+
+        for database in planned_databases {
+            let path = database.path.to_string_lossy().to_string();
+            let mut hydration_session_ids = database.scan.dirty_session_ids.clone();
+            if let Some(pending) = &pending_recovery {
+                hydration_session_ids.extend(
+                    pending
+                        .session_scopes
+                        .iter()
+                        .filter(|scope| scope.source_path == path)
+                        .map(|scope| scope.session_id.clone()),
+                );
+                hydration_session_ids.sort();
+                hydration_session_ids.dedup();
+            }
+            match prehydrate_opencode_database(
+                &database.path,
+                &database.scan,
+                &hydration_session_ids,
+                &next_doc_id,
+                &paths.state,
+            ) {
+                Ok(prepared) => {
+                    opencode_database_outcomes.insert(path, OpencodeDatabaseOutcome::Ready);
+                    opencode_diagnostics.merge(prepared.diagnostics.clone());
+                    opencode_ready_databases.push(prepared);
+                }
+                Err(_) => {
+                    opencode_database_outcomes.insert(path, OpencodeDatabaseOutcome::Failed);
+                    files_skipped += 1;
+                }
+            }
+        }
+        opencode_ready_databases.sort_by(|left, right| left.path.cmp(&right.path));
+
+        let mut owner_by_session = HashMap::<String, String>::new();
+        let mut failed_previous = state
+            .opencode_databases
+            .iter()
+            .filter(|(path, _)| {
+                matches!(
+                    classify_opencode_database_outcome(
+                        opencode_database_outcomes.get(*path).copied(),
+                        opencode_discovered_database_paths.contains(*path),
+                        true,
+                    ),
+                    OpencodeDatabaseOutcome::Failed
+                )
+            })
+            .collect::<Vec<_>>();
+        failed_previous.sort_by_key(|(path, _)| *path);
+        for (path, previous) in failed_previous {
+            for session_id in &previous.owned_session_ids {
+                claim_opencode_session_owner(&mut owner_by_session, session_id.clone(), path);
+            }
+        }
+        for database in &opencode_ready_databases {
+            let path = database.path.to_string_lossy().to_string();
+            for session in &database.scan.sessions {
+                claim_opencode_session_owner(&mut owner_by_session, session.id.clone(), &path);
+            }
+        }
+        for (path, previous) in &state.opencode_databases {
+            let outcome = classify_opencode_database_outcome(
+                opencode_database_outcomes.get(path).copied(),
+                opencode_discovered_database_paths.contains(path),
+                true,
+            );
+            if outcome != OpencodeDatabaseOutcome::Ready {
+                if outcome == OpencodeDatabaseOutcome::ConfirmedAbsent {
+                    opencode_database_paths_to_delete.push(path.clone());
+                }
+                continue;
+            }
+            for session_id in &previous.owned_session_ids {
+                if owner_by_session.get(session_id) != Some(path) {
+                    opencode_scope_targets.push(SessionScope {
+                        source_path: path.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+        }
+
+        for database in &opencode_ready_databases {
+            let path = database.path.to_string_lossy().to_string();
+            let owned_sessions = database
+                .scan
+                .sessions
+                .iter()
+                .filter(|session| owner_by_session.get(&session.id) == Some(&path))
+                .collect::<Vec<_>>();
+            let owned_session_ids = owned_sessions
+                .iter()
+                .map(|session| session.id.clone())
+                .collect::<HashSet<_>>();
+            opencode_ready_owned_sessions.insert(path.clone(), owned_session_ids.clone());
+            for session in &owned_sessions {
+                opencode_session_cwds.insert(
+                    SessionScope {
+                        source_path: path.clone(),
+                        session_id: session.id.clone(),
+                    },
+                    session.directory.clone(),
+                );
+            }
+            for session_id in &database.scan.dirty_session_ids {
+                if owner_by_session.get(session_id) == Some(&path) {
+                    opencode_scope_targets.push(SessionScope {
+                        source_path: path.clone(),
+                        session_id: session_id.clone(),
+                    });
+                }
+            }
+            opencode_database_states.insert(
+                path,
+                crate::state::OpencodeDatabaseState {
+                    parser_version: crate::sources::opencode::DATABASE_STATE_VERSION,
+                    event_rowid: database.scan.cursor.event_rowid,
+                    event_id: database.scan.cursor.event_id.clone(),
+                    owned_session_ids,
+                },
+            );
+        }
+        if let Some(pending) = &pending_recovery {
+            deferred_pending_scopes = pending
+                .session_scopes
+                .iter()
+                .filter(|scope| {
+                    classify_opencode_database_outcome(
+                        opencode_database_outcomes.get(&scope.source_path).copied(),
+                        opencode_discovered_database_paths.contains(&scope.source_path),
+                        true,
+                    ) == OpencodeDatabaseOutcome::Failed
+                })
+                .cloned()
+                .collect();
+            for scope in &pending.session_scopes {
+                if matches!(
+                    opencode_database_outcomes.get(&scope.source_path),
+                    Some(OpencodeDatabaseOutcome::Ready)
+                ) {
+                    opencode_scope_targets.push(scope.clone());
+                }
+            }
+        }
+        opencode_scope_targets.sort_by(|left, right| {
+            left.source_path
+                .cmp(&right.source_path)
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+        opencode_scope_targets.dedup();
+        opencode_database_paths_to_delete.sort();
+        opencode_database_paths_to_delete.dedup();
+
         let opencode_files = crate::sources::opencode::discover_sessions()?;
         for source_file in opencode_files {
             let path = source_file.path;
             if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let session_id = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default();
+            if owner_by_session.contains_key(session_id) {
+                let path_key = path.to_string_lossy().to_string();
+                state.files.remove(&path_key);
+                opencode_legacy_paths_to_delete.push(path_key);
                 files_skipped += 1;
                 continue;
             }
@@ -843,14 +1241,48 @@ pub fn ingest_all(
     let recover_vectors = pending_recovery
         .as_ref()
         .is_some_and(|pending| pending.vector_publication);
+    let pending_ready_scope_recovery = pending_recovery.as_ref().is_some_and(|pending| {
+        pending.session_scopes.iter().any(|scope| {
+            matches!(
+                opencode_database_outcomes.get(&scope.source_path),
+                Some(OpencodeDatabaseOutcome::Ready)
+            )
+        })
+    });
+    let recover_vector_cleanup = pending_ready_scope_recovery
+        || pending_recovery.as_ref().is_some_and(|pending| {
+            pending
+                .source_paths
+                .iter()
+                .any(|path| crate::sources::opencode::is_database_path(path))
+        });
     let mut delete_paths = pending_recovery
         .as_ref()
         .map(|pending| pending.source_paths.clone())
         .unwrap_or_default();
+    delete_paths.extend(opencode_database_paths_to_delete.clone());
+    delete_paths.extend(opencode_legacy_paths_to_delete.clone());
     delete_paths.extend(excluded_state_paths);
     delete_paths.extend(excluded_index_paths);
     delete_paths.sort();
     delete_paths.dedup();
+    let pending_database_paths_to_delete = pending_recovery
+        .as_ref()
+        .map(|pending| {
+            pending
+                .source_paths
+                .iter()
+                .filter(|path| crate::sources::opencode::is_database_path(path))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut installed_opencode_states = state.opencode_databases.clone();
+    for path in &opencode_database_paths_to_delete {
+        installed_opencode_states.remove(path);
+    }
+    installed_opencode_states.extend(opencode_database_states.clone());
+    let opencode_database_state_changed = installed_opencode_states != state.opencode_databases;
 
     let totals = compute_totals(&tasks);
     let file_totals = compute_file_totals(&tasks);
@@ -860,18 +1292,30 @@ pub fn ingest_all(
     if !recover_vectors
         && tasks.is_empty()
         && delete_paths.is_empty()
+        && opencode_scope_targets.is_empty()
+        && opencode_ready_databases
+            .iter()
+            .all(|database| database.scan.dirty_session_ids.is_empty())
         && can_skip_noop_index(paths, index, options)?
     {
         if analytics_needs_backfill {
             backfill_from_index(&analytics_db, index)?;
         }
         index.publish_generation_if_uninitialized()?;
-        if recovering_pending_ingest {
+        state.opencode_databases = installed_opencode_states;
+        if recovering_pending_ingest || empty_index_rebuild {
+            state.save(&state_path)?;
+        }
+        if opencode_database_state_changed {
             state.save(&state_path)?;
         }
         update_scan_cache(paths, files_scanned, total_bytes)?;
         if recovering_pending_ingest {
-            PendingIngest::clear(&pending_ingest_path(paths))?;
+            finalize_pending_ingest(
+                &pending_ingest_path(paths),
+                &deferred_pending_scopes,
+                state.next_doc_id,
+            )?;
         }
         return Ok(IngestReport {
             records_added: 0,
@@ -893,10 +1337,19 @@ pub fn ingest_all(
         vector_migration.model = model;
     }
     let embeddings = options.embeddings || vector_migration.rebuild || recover_vectors;
+    let vector_publication = embeddings
+        || ((recover_vector_cleanup
+            || !opencode_scope_targets.is_empty()
+            || !opencode_database_paths_to_delete.is_empty())
+            && crate::vector::VectorIndex::exists(&paths.vectors));
     let progress = Arc::new(Progress::new(totals, file_totals, embeddings));
 
     let (raw_tx_record, rx_record) = record_channel();
     let shared_diagnostics = Arc::new(Mutex::new(crate::sources::ParseDiagnostics::default()));
+    shared_diagnostics
+        .lock()
+        .unwrap()
+        .merge(opencode_diagnostics);
     let tx_record = RecordSender::with_diagnostics(
         raw_tx_record,
         options.tool_content_limits,
@@ -921,10 +1374,12 @@ pub fn ingest_all(
     );
     affected_paths.sort();
     affected_paths.dedup();
+    let pending_scopes = pending_scope_union(&opencode_scope_targets, &deferred_pending_scopes);
     let mut pending_ingest = PendingIngest {
         next_doc_id: state.next_doc_id,
         source_paths: affected_paths,
-        vector_publication: embeddings,
+        session_scopes: pending_scopes,
+        vector_publication,
     };
     let pending_path = pending_ingest_path(paths);
     pending_ingest
@@ -948,6 +1403,14 @@ pub fn ingest_all(
         embed_runtime: options.embed_runtime.clone(),
         tool_content_limits: options.tool_content_limits,
         reconcile_vector_ids: recover_vectors,
+        scope_targets: opencode_scope_targets.clone(),
+        opencode_session_cwds: opencode_session_cwds.clone(),
+        vector_delete_paths: opencode_database_paths_to_delete
+            .iter()
+            .chain(pending_database_paths_to_delete.iter())
+            .chain(opencode_legacy_paths_to_delete.iter())
+            .cloned()
+            .collect(),
     };
     let (decision_tx, decision_rx) = bounded(1);
     let writer_handle = std::thread::spawn(move || {
@@ -1047,6 +1510,22 @@ pub fn ingest_all(
             finish_file_task(task, &progress, &parse_skipped, result)
         })
     });
+    let parser_result = parser_result.and_then(|_| {
+        for database in &mut opencode_ready_databases {
+            let path = database.path.to_string_lossy().to_string();
+            let owned_session_ids = opencode_ready_owned_sessions
+                .get(&path)
+                .cloned()
+                .unwrap_or_default();
+            replay_opencode_spool(
+                &mut database.spool,
+                &tx_record,
+                &database.path,
+                &owned_session_ids,
+            )?;
+        }
+        Ok(())
+    });
 
     drop(tx_record);
     drop(tx_update);
@@ -1102,11 +1581,12 @@ pub fn ingest_all(
     for (path, update) in updated_files {
         state.files.insert(path, update);
     }
+    state.opencode_databases = installed_opencode_states;
     state.next_doc_id = next_doc_id.load(Ordering::SeqCst);
     state.save(&state_path)?;
 
     update_scan_cache(paths, files_scanned, total_bytes)?;
-    PendingIngest::clear(&pending_path)?;
+    finalize_pending_ingest(&pending_path, &deferred_pending_scopes, state.next_doc_id)?;
 
     Ok(IngestReport {
         records_added,
@@ -1137,6 +1617,15 @@ fn can_skip_fresh_scan(
         .with_context(|| format!("check pending ingest at {}", pending_path.display()))?
     {
         return Ok(false);
+    }
+    if options.include_opencode {
+        let databases = match crate::sources::opencode::discover_databases() {
+            Ok(databases) => databases,
+            Err(_) => return Ok(false),
+        };
+        if !databases.is_empty() {
+            return Ok(false);
+        }
     }
     if index.doc_count()? == 0 {
         return Ok(false);
@@ -1224,10 +1713,33 @@ fn writer_loop(
         embed_runtime,
         tool_content_limits,
         reconcile_vector_ids,
+        scope_targets,
+        opencode_session_cwds,
+        vector_delete_paths,
     } = ctx;
     let mut analytics = AnalyticsWriter::open(&analytics_path)?;
+    let mut scoped_doc_ids = HashSet::new();
+    for scope in &scope_targets {
+        for doc_id in index.doc_ids_by_source_scope(scope)? {
+            scoped_doc_ids.insert(doc_id);
+        }
+        index.delete_by_source_scope(&mut writer, scope)?;
+    }
     for path in &delete_paths {
+        if vector_delete_paths.contains(path) {
+            for doc_id in index.doc_ids_by_source_path(path)? {
+                scoped_doc_ids.insert(doc_id);
+            }
+        }
         index.delete_by_source_path(&mut writer, path);
+    }
+    for (scope, cwd) in &opencode_session_cwds {
+        analytics.set_session_cwd(
+            SourceKind::Opencode,
+            &scope.source_path,
+            &scope.session_id,
+            cwd,
+        );
     }
 
     let mut count = 0usize;
@@ -1247,6 +1759,13 @@ fn writer_loop(
         )?);
         embedder = Some(handle);
         progress.set_embed_ready();
+    } else if (reconcile_vector_ids || !scoped_doc_ids.is_empty())
+        && crate::vector::VectorIndex::exists(&vector_dir)
+    {
+        vector_index = Some(crate::vector::VectorIndex::open(&vector_dir)?);
+    }
+    if let Some(vindex) = vector_index.as_mut() {
+        vindex.remove_doc_ids(&scoped_doc_ids)?;
     }
 
     for mut record in rx.iter() {
@@ -1304,6 +1823,9 @@ fn writer_loop(
         }
     }
 
+    for scope in &scope_targets {
+        analytics.delete_session_scope(scope)?;
+    }
     for path in delete_paths {
         analytics.delete_source_path(&path)?;
     }
@@ -1311,20 +1833,19 @@ fn writer_loop(
     writer.commit()?;
     index.maybe_compact_continuous_segments(&mut writer)?;
     let mut staged_vectors = None;
-    if embeddings {
-        if reconcile_vector_ids {
-            let mut live_doc_ids = HashSet::new();
-            index.for_each_record(|record| {
-                if is_embedding_role(&record.role) && !record.text.is_empty() {
-                    live_doc_ids.insert(record.doc_id);
-                }
-                Ok(())
-            })?;
-            vector_index
-                .as_mut()
-                .expect("vector index initialized")
-                .retain_doc_ids(&live_doc_ids)?;
+    if reconcile_vector_ids {
+        let mut live_doc_ids = HashSet::new();
+        index.for_each_record(|record| {
+            if is_embedding_role(&record.role) && !record.text.is_empty() {
+                live_doc_ids.insert(record.doc_id);
+            }
+            Ok(())
+        })?;
+        if let Some(vindex) = vector_index.as_mut() {
+            vindex.retain_doc_ids(&live_doc_ids)?;
         }
+    }
+    if embeddings {
         if !embed_buffer.is_empty() {
             embedded_count += flush_embeddings(
                 &mut embed_buffer,
@@ -1348,12 +1869,12 @@ fn writer_loop(
                 &progress,
             )?;
         }
-        if let Some(vindex) = vector_index.as_ref() {
-            staged_vectors = Some(vindex.stage()?);
-        }
-        if let Some(handle) = embedder.take() {
-            std::mem::forget(handle);
-        }
+    }
+    if let Some(vindex) = vector_index.as_ref() {
+        staged_vectors = Some(vindex.stage()?);
+    }
+    if let Some(handle) = embedder.take() {
+        std::mem::forget(handle);
     }
     writer.wait_merging_threads()?;
     index.publish_generation()?;
@@ -2121,6 +2642,7 @@ mod tests {
         PendingIngest {
             next_doc_id: 100,
             source_paths: vec![source_path.clone()],
+            session_scopes: Vec::new(),
             vector_publication: false,
         }
         .save(&pending_ingest_path(&paths))
@@ -2251,6 +2773,7 @@ mod tests {
         PendingIngest {
             next_doc_id: 100,
             source_paths: vec![source_path.clone()],
+            session_scopes: Vec::new(),
             vector_publication: true,
         }
         .save(&pending_ingest_path(&paths))
@@ -2386,6 +2909,7 @@ mod tests {
         PendingIngest {
             next_doc_id: 3,
             source_paths: Vec::new(),
+            session_scopes: Vec::new(),
             vector_publication: true,
         }
         .save(&pending_ingest_path(&paths))
@@ -2405,6 +2929,47 @@ mod tests {
             PendingIngest::load(&pending_ingest_path(&paths)).expect("pending marker"),
             None
         );
+    }
+
+    #[test]
+    fn vector_recovery_runs_when_pending_session_scopes_are_present() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure dirs");
+        let index = save_search_records(
+            &paths,
+            &[record(1, "user", "first"), record(2, "assistant", "second")],
+        );
+        index
+            .publish_generation_if_uninitialized()
+            .expect("publish initial lexical generation");
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 256, Some("potion"))
+            .expect("create interrupted vectors");
+        vectors.add(1, &vec![0.0; 256]).expect("add live vector");
+        vectors.add(99, &vec![0.0; 256]).expect("add stale vector");
+        vectors.save().expect("save interrupted vectors");
+        PendingIngest {
+            next_doc_id: 3,
+            source_paths: Vec::new(),
+            session_scopes: vec![SessionScope {
+                source_path: "/unavailable/opencode.db".to_string(),
+                session_id: "deferred-session".to_string(),
+            }],
+            vector_publication: true,
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending vector publication with deferred scope");
+
+        let index =
+            SearchIndex::open_or_create_for_ingest(&paths.index).expect("recovery generation");
+        let lease = ingest_lease(&paths);
+        let options = ingest_options(false, ModelChoice::Potion);
+        ingest_all(&paths, &index, &options, &lease).expect("finish vector recovery");
+
+        let vectors = VectorIndex::inventory(&paths.vectors)
+            .expect("vector inventory")
+            .expect("vectors");
+        assert_eq!(vectors.doc_ids, HashSet::from([1, 2]));
     }
 
     #[test]
@@ -2605,6 +3170,9 @@ mod tests {
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
             reconcile_vector_ids: false,
+            scope_targets: Vec::new(),
+            opencode_session_cwds: HashMap::new(),
+            vector_delete_paths: HashSet::new(),
         };
         let writer = index.writer().expect("writer");
 
@@ -2669,6 +3237,9 @@ mod tests {
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
             reconcile_vector_ids: false,
+            scope_targets: Vec::new(),
+            opencode_session_cwds: HashMap::new(),
+            vector_delete_paths: HashSet::new(),
         };
         let writer = index.writer().expect("writer");
 
@@ -2774,6 +3345,369 @@ mod tests {
             file_count: 0,
             total_bytes: 0,
         }
+    }
+
+    #[test]
+    fn database_races_are_failed_but_successful_inventory_absence_is_confirmed() {
+        assert_eq!(
+            classify_opencode_database_outcome(None, true, true),
+            OpencodeDatabaseOutcome::Failed
+        );
+        assert_eq!(
+            classify_opencode_database_outcome(None, false, true),
+            OpencodeDatabaseOutcome::ConfirmedAbsent
+        );
+        assert_eq!(
+            classify_opencode_database_outcome(None, false, false),
+            OpencodeDatabaseOutcome::Failed
+        );
+    }
+
+    #[test]
+    fn failed_database_owner_has_priority_over_ready_duplicate() {
+        let mut owners = HashMap::new();
+        claim_opencode_session_owner(&mut owners, "session".to_string(), "/failed.db");
+        claim_opencode_session_owner(&mut owners, "session".to_string(), "/ready.db");
+        assert_eq!(
+            owners.get("session").map(String::as_str),
+            Some("/failed.db")
+        );
+    }
+
+    #[test]
+    fn prepublication_pending_intent_keeps_active_and_deferred_scopes() {
+        let active = SessionScope {
+            source_path: "/ready.db".to_string(),
+            session_id: "active".to_string(),
+        };
+        let deferred = SessionScope {
+            source_path: "/failed.db".to_string(),
+            session_id: "deferred".to_string(),
+        };
+        let scopes = pending_scope_union(
+            std::slice::from_ref(&active),
+            &[deferred.clone(), active.clone()],
+        );
+        assert_eq!(scopes, vec![deferred, active]);
+    }
+
+    #[test]
+    fn pending_session_scopes_retain_database_state_for_recovery() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let database_path = temp
+            .path()
+            .join("opencode.db")
+            .to_string_lossy()
+            .to_string();
+        let scope = SessionScope {
+            source_path: database_path.clone(),
+            session_id: "session".to_string(),
+        };
+        let mut state = IngestState::default();
+        state.opencode_databases.insert(
+            database_path.clone(),
+            crate::state::OpencodeDatabaseState {
+                owned_session_ids: ["session".to_string()].into_iter().collect(),
+                ..Default::default()
+            },
+        );
+        PendingIngest {
+            next_doc_id: 1,
+            source_paths: Vec::new(),
+            session_scopes: vec![scope],
+            vector_publication: false,
+        }
+        .save(&pending_ingest_path(&paths))
+        .unwrap();
+        prepare_pending_ingest_recovery(&paths, &mut state)
+            .unwrap()
+            .expect("pending recovery");
+        assert!(state.opencode_databases.contains_key(&database_path));
+
+        PendingIngest::clear(&pending_ingest_path(&paths)).unwrap();
+        PendingIngest {
+            next_doc_id: 1,
+            source_paths: vec![database_path.clone()],
+            session_scopes: Vec::new(),
+            vector_publication: false,
+        }
+        .save(&pending_ingest_path(&paths))
+        .unwrap();
+        prepare_pending_ingest_recovery(&paths, &mut state)
+            .unwrap()
+            .expect("full-path pending recovery");
+        assert!(!state.opencode_databases.contains_key(&database_path));
+    }
+
+    #[test]
+    fn stale_opencode_spools_are_cleaned_without_touching_other_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let stale = paths.state.join(format!("{OPENCODE_SPOOL_PREFIX}stale"));
+        let unrelated = paths.state.join("unrelated");
+        fs::write(&stale, b"stale").unwrap();
+        fs::write(&unrelated, b"keep").unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        ingest_all(
+            &paths,
+            &index,
+            &ingest_options(false, ModelChoice::default()),
+            &ingest_lease(&paths),
+        )
+        .unwrap();
+        assert!(!stale.exists());
+        assert_eq!(fs::read(unrelated).unwrap(), b"keep");
+    }
+
+    #[test]
+    fn empty_index_rebuild_persists_cleared_database_state() {
+        let temp = tempfile::tempdir().unwrap();
+        let paths = Paths::new(Some(temp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let database_path = temp
+            .path()
+            .join("opencode.db")
+            .to_string_lossy()
+            .to_string();
+        let mut state = IngestState::default();
+        state.opencode_databases.insert(
+            database_path,
+            crate::state::OpencodeDatabaseState::default(),
+        );
+        state.save(&paths.state.join("ingest.json")).unwrap();
+        let index = SearchIndex::open_or_create(&paths.index).unwrap();
+        ingest_all(
+            &paths,
+            &index,
+            &ingest_options(false, ModelChoice::default()),
+            &ingest_lease(&paths),
+        )
+        .unwrap();
+        let state = IngestState::load(&paths.state.join("ingest.json")).unwrap();
+        assert!(state.opencode_databases.is_empty());
+    }
+
+    #[test]
+    fn modern_opencode_database_ingests_once_and_skips_noop_hydration() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("opencode.db");
+        let db = rusqlite::Connection::open(&db_path).expect("open OpenCode fixture");
+        db.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+             );
+             CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+             );
+             CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+             INSERT INTO session VALUES ('ses_db-session', NULL, '/tmp', 1, 2);
+             INSERT INTO message VALUES ('db-message', 'ses_db-session', 3, '{\"role\":\"assistant\"}');
+             INSERT INTO part VALUES ('db-part', 'db-message', '{\"type\":\"text\",\"text\":\"before\"}');
+             INSERT INTO event VALUES ('db-event-1', 'ses_db-session');",
+        )
+        .expect("write OpenCode fixture");
+        drop(db);
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(tmp.path().as_os_str()))]);
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("ensure paths");
+        let index = open_search_index(&paths);
+        let legacy_path = tmp.path().join("storage/message/ses_db-session");
+        fs::create_dir_all(&legacy_path).expect("create legacy session");
+        let mut legacy_record = record(900, "user", "legacy copy");
+        legacy_record.source = SourceKind::Opencode;
+        legacy_record.session_id = "ses_db-session".to_string();
+        legacy_record.source_path = legacy_path.to_string_lossy().to_string();
+        let mut seed_writer = index.writer().expect("open seed writer");
+        index
+            .add_record(&mut seed_writer, &legacy_record)
+            .expect("seed legacy record");
+        seed_writer.commit().expect("commit legacy record");
+        drop(seed_writer);
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 4, Some("fixture"))
+            .expect("create legacy vector");
+        vectors
+            .add(legacy_record.doc_id, &[1.0, 0.0, 0.0, 0.0])
+            .expect("seed legacy vector");
+        vectors.save().expect("save legacy vector");
+        let mut options = ingest_options(false, ModelChoice::Gemma);
+        options.include_opencode = true;
+
+        let first = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+        assert_eq!(first.expect("initial database ingest").records_added, 1);
+        let source_path = db_path.to_string_lossy().to_string();
+        let records = index
+            .records_by_session_id("ses_db-session")
+            .expect("database records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].source_path, source_path);
+        assert_eq!(records[0].text, "before");
+        assert!(
+            !VectorIndex::inventory(&paths.vectors)
+                .expect("inspect legacy vector removal")
+                .expect("legacy vectors")
+                .doc_ids
+                .contains(&legacy_record.doc_id)
+        );
+        let analytics =
+            crate::analytics::AnalyticsStore::open_read_only(analytics_path(&paths.state))
+                .expect("open analytics");
+        let sessions = analytics
+            .query_sessions(
+                Some(crate::types::SourceFilter::Opencode),
+                None,
+                None,
+                crate::analytics::ProjectGrouping::Flat,
+                None,
+            )
+            .expect("query analytics");
+        assert_eq!(sessions[0].cwd.as_deref(), Some("/tmp"));
+
+        let second = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+        assert_eq!(second.expect("no-op database ingest").records_added, 0);
+
+        let db = rusqlite::Connection::open(&db_path).expect("reopen OpenCode fixture");
+        db.execute(
+            "UPDATE part SET data = '{\"type\":\"text\",\"text\":\"without event\"}'",
+            [],
+        )
+        .expect("update part without event");
+        drop(db);
+        let third = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+        assert_eq!(
+            third.expect("unchanged event cursor ingest").records_added,
+            0
+        );
+        assert_eq!(
+            index.records_by_session_id("ses_db-session").unwrap()[0].text,
+            "before"
+        );
+        let doc_id = index.records_by_session_id("ses_db-session").unwrap()[0].doc_id;
+        let mut vectors = VectorIndex::open_or_create(&paths.vectors, 4, Some("fixture"))
+            .expect("create fixture vectors");
+        vectors
+            .add(doc_id, &[1.0, 0.0, 0.0, 0.0])
+            .expect("seed fixture vector");
+        vectors.save().expect("save fixture vector");
+
+        let db = rusqlite::Connection::open(&db_path).expect("reopen OpenCode fixture");
+        db.execute_batch(
+            "UPDATE part SET data = '{\"type\":\"text\",\"text\":\"after event\"}';
+             INSERT INTO event VALUES ('db-event-2', 'ses_db-session');",
+        )
+        .expect("update OpenCode fixture");
+        drop(db);
+        let fourth = ingest_all(&paths, &index, &options, &ingest_lease(&paths));
+        assert_eq!(fourth.expect("event database ingest").records_added, 1);
+        let records = index
+            .records_by_session_id("ses_db-session")
+            .expect("updated records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "after event");
+        assert!(
+            VectorIndex::inventory(&paths.vectors)
+                .expect("inspect updated vectors")
+                .expect("fixture vectors")
+                .doc_ids
+                .is_empty()
+        );
+
+        fs::remove_dir_all(&legacy_path).expect("remove legacy fallback");
+        let unrelated_source = tmp.path().join("claude");
+        fs::create_dir_all(&unrelated_source).expect("create unrelated source");
+        fs::write(
+            unrelated_source.join("unrelated.jsonl"),
+            r#"{"type":"user","uuid":"unrelated","sessionId":"unrelated-session","timestamp":"2026-08-08T11:00:00Z","message":{"content":"unrelated source"}}
+"#,
+        )
+        .expect("write unrelated source");
+        options.claude_sources = vec![unrelated_source];
+        PendingIngest {
+            next_doc_id: 1,
+            source_paths: Vec::new(),
+            session_scopes: vec![SessionScope {
+                source_path: source_path.clone(),
+                session_id: "ses_db-session".to_string(),
+            }],
+            vector_publication: false,
+        }
+        .save(&pending_ingest_path(&paths))
+        .expect("save pending database scope");
+        fs::write(&db_path, b"corrupt OpenCode database").expect("corrupt OpenCode database");
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths))
+            .expect("failed database falls back safely");
+        assert_eq!(index.doc_count().expect("remaining document count"), 2);
+        assert_eq!(
+            index.records_by_session_id("ses_db-session").unwrap()[0].text,
+            "after event"
+        );
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("load ingest state");
+        assert!(
+            state.opencode_databases.contains_key(&source_path),
+            "failed database state must be preserved"
+        );
+        let pending = PendingIngest::load(&pending_ingest_path(&paths))
+            .expect("load deferred scope")
+            .expect("deferred scope marker");
+        assert_eq!(pending.source_paths, Vec::<String>::new());
+        assert_eq!(pending.session_scopes.len(), 1);
+
+        fs::remove_file(&db_path).expect("remove corrupt database");
+        let db = rusqlite::Connection::open(&db_path).expect("recreate OpenCode fixture");
+        db.execute_batch(
+            "CREATE TABLE session (
+                id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT,
+                time_created INTEGER, time_updated INTEGER
+             );
+             CREATE TABLE message (
+                id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT
+             );
+             CREATE TABLE part (
+                id TEXT PRIMARY KEY, message_id TEXT, data TEXT
+             );
+             CREATE TABLE event (id TEXT NOT NULL, aggregate_id TEXT NOT NULL);
+             INSERT INTO session VALUES ('ses_db-session', NULL, '/recovered', 2, 3);
+             INSERT INTO message VALUES ('recovered-message', 'ses_db-session', 4, '{\"role\":\"assistant\"}');
+             INSERT INTO part VALUES ('recovered-part', 'recovered-message', '{\"type\":\"text\",\"text\":\"recovered\"}');
+             INSERT INTO session VALUES ('ses_reappeared', NULL, '/reappeared', 4, 5);
+             INSERT INTO message VALUES ('reappeared-message', 'ses_reappeared', 6, '{\"role\":\"assistant\"}');
+             INSERT INTO part VALUES ('reappeared-part', 'reappeared-message', '{\"type\":\"text\",\"text\":\"reappeared\"}');
+             INSERT INTO event VALUES ('reappeared-event', 'ses_reappeared');",
+        )
+        .expect("write reappeared OpenCode fixture");
+        drop(db);
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths))
+            .expect("reappeared database cold hydration");
+        let records = index
+            .records_by_session_id("ses_reappeared")
+            .expect("reappeared database records");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].text, "reappeared");
+        assert_eq!(
+            index.records_by_session_id("ses_db-session").unwrap()[0].text,
+            "recovered"
+        );
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("load ingest state");
+        assert!(state.opencode_databases.contains_key(&source_path));
+        assert!(
+            PendingIngest::load(&pending_ingest_path(&paths))
+                .expect("load resolved scope")
+                .is_none()
+        );
+
+        fs::remove_file(&db_path).expect("remove unavailable database");
+        ingest_all(&paths, &index, &options, &ingest_lease(&paths))
+            .expect("confirmed-absent database cleanup");
+        assert_eq!(index.doc_count().expect("remaining document count"), 1);
+        let state = IngestState::load(&paths.state.join("ingest.json")).expect("load ingest state");
+        assert!(!state.opencode_databases.contains_key(&source_path));
     }
 
     #[test]
@@ -3533,12 +4467,32 @@ mod tests {
         PendingIngest {
             next_doc_id: 2,
             source_paths: vec!["source-1.jsonl".to_string()],
+            session_scopes: Vec::new(),
             vector_publication: false,
         }
         .save(&pending_ingest_path(&paths))
         .expect("save pending ingest");
 
         assert!(!can_skip_fresh_scan(&cache, &paths, &index, &options, 60).unwrap());
+    }
+
+    #[test]
+    fn database_discovery_error_never_allows_fresh_scan_skip() {
+        let _guard = env_lock();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let bad_root = tmp.path().join("not-a-directory");
+        fs::write(&bad_root, "fixture").expect("write invalid data root");
+        let _env = EnvVarGuard::set_os(&[("OPENCODE_DATA_DIR", Some(bad_root.as_os_str()))]);
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        let index = save_search_records(&paths, &[record(1, "user", "hello")]);
+        let options = ingest_options(false, ModelChoice::BGESmall);
+        let mut options = options;
+        options.include_opencode = true;
+        mark_analytics_complete(&paths);
+
+        assert!(!can_skip_fresh_scan(&fresh_scan_cache(), &paths, &index, &options, 60).unwrap());
+        assert!(ingest_all(&paths, &index, &options, &ingest_lease(&paths)).is_err());
+        assert_eq!(index.doc_count().expect("preserved documents"), 1);
     }
 
     #[test]
@@ -4242,6 +5196,9 @@ mod tests {
             embed_runtime: EmbedRuntimeConfig::default(),
             tool_content_limits: IndexedToolContentLimits::default(),
             reconcile_vector_ids: false,
+            scope_targets: Vec::new(),
+            opencode_session_cwds: HashMap::new(),
+            vector_delete_paths: HashSet::new(),
         };
 
         let writer = index.writer().expect("open writer");
