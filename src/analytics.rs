@@ -1494,7 +1494,8 @@ mod tests {
         fs::write(
             &transcript,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"cwd\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                repo.display(),
                 repo.display()
             ),
         )

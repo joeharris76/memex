@@ -412,6 +412,8 @@ enum SourceChoice {
     Copilot,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
 }
 
 impl SourceChoice {
@@ -427,7 +429,9 @@ impl SourceChoice {
             SourceChoice::OpenClaw => SourceChoice::Copilot,
             SourceChoice::Copilot => SourceChoice::Grok,
             SourceChoice::Grok => SourceChoice::Hermes,
-            SourceChoice::Hermes => SourceChoice::All,
+            SourceChoice::Hermes => SourceChoice::Jcode,
+            SourceChoice::Jcode => SourceChoice::Muse,
+            SourceChoice::Muse => SourceChoice::All,
         }
     }
 
@@ -444,6 +448,8 @@ impl SourceChoice {
             SourceChoice::Copilot => Some(SourceFilter::Copilot),
             SourceChoice::Grok => Some(SourceFilter::Grok),
             SourceChoice::Hermes => Some(SourceFilter::Hermes),
+            SourceChoice::Jcode => Some(SourceFilter::Jcode),
+            SourceChoice::Muse => Some(SourceFilter::Muse),
         }
     }
 
@@ -460,6 +466,8 @@ impl SourceChoice {
             SourceChoice::Copilot => "copilot",
             SourceChoice::Grok => "grok",
             SourceChoice::Hermes => "hermes",
+            SourceChoice::Jcode => "jcode",
+            SourceChoice::Muse => "muse",
         }
     }
 
@@ -475,6 +483,8 @@ impl SourceChoice {
             SourceKind::Copilot => SourceChoice::Copilot,
             SourceKind::Grok => SourceChoice::Grok,
             SourceKind::Hermes => SourceChoice::Hermes,
+            SourceKind::Jcode => SourceChoice::Jcode,
+            SourceKind::Muse => SourceChoice::Muse,
         }
     }
 }
@@ -1117,6 +1127,8 @@ impl App {
                     include_openclaw: true,
                     include_copilot: true,
                     include_grok: true,
+                    include_jcode: true,
+                    include_muse: true,
                     exclude_patterns: config.exclude_path_patterns(),
                     embeddings: embeddings_default,
                     backfill_embeddings: false,
@@ -2510,6 +2522,8 @@ impl App {
             SourceKind::Grok => "grok",
             SourceKind::Omp => "omp",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
         };
         let source_path = session.source_path.clone();
 
@@ -3958,6 +3972,8 @@ fn source_choice_matches_storage_label(choice: SourceChoice, label: &str) -> boo
         SourceChoice::Copilot => label == "copilot",
         SourceChoice::Grok => label == "grok",
         SourceChoice::Hermes => label == "hermes",
+        SourceChoice::Jcode => label == "jcode",
+        SourceChoice::Muse => label == "muse",
         SourceChoice::All => false,
     }
 }
@@ -3974,6 +3990,8 @@ fn source_color(source: SourceKind) -> Color {
         SourceKind::Copilot => Color::Rgb(140, 160, 220),
         SourceKind::Grok => Color::Rgb(255, 120, 90),
         SourceKind::Hermes => Color::Rgb(190, 150, 220),
+        SourceKind::Jcode => Color::Rgb(220, 140, 180),
+        SourceKind::Muse => Color::Rgb(180, 130, 240),
     }
 }
 

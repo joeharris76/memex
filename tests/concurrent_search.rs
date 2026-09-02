@@ -38,8 +38,12 @@ fn concurrent_searches_coalesce_stale_auto_indexing() {
             "--no-opencode",
             "--no-cursor",
             "--no-pi",
+            "--no-omp",
+            "--no-openclaw",
             "--no-copilot",
             "--no-grok",
+            "--no-jcode",
+            "--no-muse",
             "--no-embeddings",
         ])
         .arg("--root")

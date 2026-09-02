@@ -15,10 +15,12 @@ pub enum SourceKind {
     Omp,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
 }
 
 impl SourceKind {
-    pub const ALL: [SourceKind; 10] = [
+    pub const ALL: [SourceKind; 12] = [
         SourceKind::Claude,
         SourceKind::Codex,
         SourceKind::Opencode,
@@ -29,6 +31,8 @@ impl SourceKind {
         SourceKind::Omp,
         SourceKind::Grok,
         SourceKind::Hermes,
+        SourceKind::Jcode,
+        SourceKind::Muse,
     ];
     pub const COUNT: usize = Self::ALL.len();
 
@@ -44,6 +48,8 @@ impl SourceKind {
             SourceKind::Omp => 7,
             SourceKind::Grok => 8,
             SourceKind::Hermes => 9,
+            SourceKind::Jcode => 10,
+            SourceKind::Muse => 11,
         }
     }
 
@@ -59,6 +65,8 @@ impl SourceKind {
             7 => Some(SourceKind::Omp),
             8 => Some(SourceKind::Grok),
             9 => Some(SourceKind::Hermes),
+            10 => Some(SourceKind::Jcode),
+            11 => Some(SourceKind::Muse),
             _ => None,
         }
     }
@@ -75,6 +83,8 @@ impl SourceKind {
             SourceKind::Omp => "omp",
             SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
         }
     }
 
@@ -90,6 +100,8 @@ impl SourceKind {
             SourceKind::Omp => "omp",
             SourceKind::Grok => "grok",
             SourceKind::Hermes => "hermes",
+            SourceKind::Jcode => "jcode",
+            SourceKind::Muse => "muse",
         }
     }
 
@@ -109,6 +121,8 @@ impl SourceKind {
             "omp" => Some(SourceKind::Omp),
             "grok" => Some(SourceKind::Grok),
             "hermes" => Some(SourceKind::Hermes),
+            "jcode" => Some(SourceKind::Jcode),
+            "muse" => Some(SourceKind::Muse),
             _ => None,
         }
     }
@@ -129,6 +143,8 @@ pub enum SourceFilter {
     Omp,
     Grok,
     Hermes,
+    Jcode,
+    Muse,
 }
 
 impl SourceFilter {
@@ -144,6 +160,8 @@ impl SourceFilter {
             SourceFilter::Omp => source == SourceKind::Omp,
             SourceFilter::Grok => source == SourceKind::Grok,
             SourceFilter::Hermes => source == SourceKind::Hermes,
+            SourceFilter::Jcode => source == SourceKind::Jcode,
+            SourceFilter::Muse => source == SourceKind::Muse,
         }
     }
 
@@ -159,6 +177,8 @@ impl SourceFilter {
             SourceFilter::Omp => &["omp"],
             SourceFilter::Grok => &["grok"],
             SourceFilter::Hermes => &["hermes"],
+            SourceFilter::Jcode => &["jcode"],
+            SourceFilter::Muse => &["muse"],
         }
     }
 
@@ -174,6 +194,8 @@ impl SourceFilter {
             SourceFilter::Omp => "omp",
             SourceFilter::Grok => "grok",
             SourceFilter::Hermes => "hermes",
+            SourceFilter::Jcode => "jcode",
+            SourceFilter::Muse => "muse",
         }
     }
 }

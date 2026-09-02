@@ -1540,6 +1540,12 @@ fn resolve_cwd_from_source(records: &[Record]) -> Option<PathBuf> {
             crate::sources::grok::session_cwd(Path::new(&first.source_path)).map(PathBuf::from)
         }
         SourceKind::Hermes => None,
+        SourceKind::Jcode => {
+            crate::sources::jcode::cwd_from_jcode_session(Path::new(&first.source_path))
+        }
+        SourceKind::Muse => {
+            crate::sources::muse::cwd_from_muse_session(Path::new(&first.source_path))
+        }
     }
     .filter(|path| path.is_dir())
 }

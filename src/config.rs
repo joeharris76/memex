@@ -167,6 +167,10 @@ pub struct UserConfig {
     pub omp_resume_cmd: Option<String>,
     /// Resume command template for GitHub Copilot CLI sessions.
     pub copilot_resume_cmd: Option<String>,
+    /// Resume command template for Jcode sessions.
+    pub jcode_resume_cmd: Option<String>,
+    /// Resume command template for Muse sessions.
+    pub muse_resume_cmd: Option<String>,
     /// Resume command template for Grok sessions.
     pub grok_resume_cmd: Option<String>,
     /// How resume behaves inside a herdr pane: "tab" (default), "split", or "off".
