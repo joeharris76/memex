@@ -545,7 +545,14 @@ impl AnalyticsStore {
     }
 
     pub fn query_source_timestamps(&self, since_ms: Option<u64>) -> Result<Vec<(SourceKind, u64)>> {
-        self.query_source_timestamps_filtered(None, since_ms, None, None, ProjectGrouping::Flat)
+        self.query_source_timestamps_filtered(
+            None,
+            since_ms,
+            None,
+            None,
+            ProjectGrouping::Flat,
+            None,
+        )
     }
 
     pub fn query_source_timestamps_filtered(
@@ -555,6 +562,7 @@ impl AnalyticsStore {
         until_ms: Option<u64>,
         project: Option<&str>,
         grouping: ProjectGrouping,
+        kind: Option<SessionKindFilter>,
     ) -> Result<Vec<(SourceKind, u64)>> {
         let mut sql = String::from("SELECT source, last_at FROM sessions");
         let mut clauses = Vec::new();
@@ -586,6 +594,21 @@ impl AnalyticsStore {
             };
             clauses.push(format!("{project_expr} = ?"));
             values.push(rusqlite::types::Value::Text(project.to_string()));
+        }
+        if let Some(kind) = kind {
+            match kind {
+                SessionKindFilter::Primary => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind = 'main')".to_string(),
+                    );
+                }
+                SessionKindFilter::Subagent => {
+                    clauses.push(
+                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                    );
+                }
+                SessionKindFilter::All => {}
+            }
         }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
@@ -2029,6 +2052,7 @@ mod tests {
                     Some(25),
                     Some("alpha"),
                     ProjectGrouping::Flat,
+                    None,
                 )
                 .expect("filtered activity"),
             vec![(SourceKind::Codex, 20)]
@@ -2338,6 +2362,42 @@ mod tests {
             .query_sessions_detailed(None, None, None, None, None)
             .expect("all");
         assert_eq!(all_rows.len(), 2);
+
+        let primary_ts = store
+            .query_source_timestamps_filtered(
+                None,
+                None,
+                None,
+                None,
+                ProjectGrouping::Flat,
+                Some(SessionKindFilter::Primary),
+            )
+            .expect("primary ts");
+        assert_eq!(primary_ts, vec![(SourceKind::Codex, 10)]);
+
+        let sub_ts = store
+            .query_source_timestamps_filtered(
+                None,
+                None,
+                None,
+                None,
+                ProjectGrouping::Flat,
+                Some(SessionKindFilter::Subagent),
+            )
+            .expect("sub ts");
+        assert_eq!(sub_ts, vec![(SourceKind::Codex, 20)]);
+
+        let all_ts = store
+            .query_source_timestamps_filtered(
+                None,
+                None,
+                None,
+                None,
+                ProjectGrouping::Flat,
+                Some(SessionKindFilter::All),
+            )
+            .expect("all ts");
+        assert_eq!(all_ts.len(), 2);
     }
 
     #[test]

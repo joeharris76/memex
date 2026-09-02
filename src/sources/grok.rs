@@ -73,6 +73,11 @@ struct GrokSummary {
     session_id: Option<String>,
     cwd: Option<String>,
     project: Option<String>,
+    title: Option<String>,
+}
+
+pub fn session_title(updates_path: &Path) -> Option<String> {
+    read_summary(updates_path).title
 }
 
 fn read_summary(updates_path: &Path) -> GrokSummary {
@@ -95,6 +100,22 @@ fn read_summary(updates_path: &Path) -> GrokSummary {
         .filter(|value| !value.is_empty())
         .or(cwd.as_deref())
         .map(super::common::project_from_path);
+    let title = value
+        .get("generated_title")
+        .or_else(|| value.get("generatedTitle"))
+        .or_else(|| value.get("title"))
+        .or_else(|| value.get("session_summary"))
+        .or_else(|| value.get("sessionSummary"))
+        .or_else(|| value.get("summary"))
+        .or_else(|| value.pointer("/info/generated_title"))
+        .or_else(|| value.pointer("/info/generatedTitle"))
+        .or_else(|| value.pointer("/info/title"))
+        .or_else(|| value.pointer("/info/session_summary"))
+        .or_else(|| value.pointer("/info/sessionSummary"))
+        .or_else(|| value.pointer("/info/summary"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+        .map(str::to_string);
     GrokSummary {
         session_id: value
             .pointer("/info/id")
@@ -102,6 +123,7 @@ fn read_summary(updates_path: &Path) -> GrokSummary {
             .map(str::to_string),
         cwd,
         project,
+        title,
     }
 }
 
@@ -690,5 +712,22 @@ mod tests {
         assert_eq!(events[0].tokens.output, 20);
         assert_eq!(events[0].tokens.reasoning, 7);
         assert_eq!(events[0].source_cost_usd, Some(0.0125));
+    }
+
+    #[test]
+    fn parses_grok_title_from_summary() {
+        let temp = TempDir::new().unwrap();
+        let session = temp.path().join("encoded-cwd").join("session-id");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("summary.json"),
+            r#"{"generated_title":"My Grok Project","info":{"id":"session-id","cwd":"/work/repo"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            session_title(&session.join("updates.jsonl")).as_deref(),
+            Some("My Grok Project")
+        );
     }
 }

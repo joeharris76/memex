@@ -1,4 +1,4 @@
-use crate::analytics::{AnalyticsStore, ProjectGrouping, analytics_path};
+use crate::analytics::{AnalyticsStore, ProjectGrouping, SessionKindFilter, analytics_path};
 use crate::config::{MachineConfig, Paths, UserConfig, default_claude_sources};
 use crate::embed::{EmbedderHandle, ModelChoice};
 use crate::index::{QueryOptions, SearchIndex, SessionScopeKey};
@@ -202,6 +202,8 @@ pub struct SessionActivitySpec {
     pub project_grouping: ProjectGrouping,
     pub since_ms: Option<u64>,
     pub until_ms: Option<u64>,
+    #[serde(default)]
+    pub kind: Option<SessionKindFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1162,6 +1164,7 @@ fn session_activity_local(
         spec.until_ms,
         spec.project.as_deref(),
         spec.project_grouping,
+        spec.kind,
     )?;
     Ok(rows
         .into_iter()
@@ -2286,6 +2289,7 @@ mod tests {
                 project_grouping: ProjectGrouping::Flat,
                 since_ms: None,
                 until_ms: None,
+                kind: None,
             },
         )
         .expect("session activity");

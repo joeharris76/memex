@@ -397,6 +397,7 @@ enum HomeDropdown {
     Range,
     Machine,
     Source,
+    Kind,
     Project,
 }
 
@@ -579,6 +580,7 @@ struct App {
     home_range_area: Rect,
     home_machine_area: Rect,
     home_source_area: Rect,
+    home_kind_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
     home_projects: Vec<String>,
@@ -633,6 +635,7 @@ enum PreviewLine {
         project: String,
         source: String,
         session_id: String,
+        kind: Option<String>,
     },
     Meta {
         role: String,
@@ -969,6 +972,7 @@ impl App {
             home_range_area: Rect::default(),
             home_machine_area: Rect::default(),
             home_source_area: Rect::default(),
+            home_kind_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
             home_projects: Vec::new(),
@@ -1053,6 +1057,7 @@ impl App {
             || !self.machine.is_empty()
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
+            || self.session_kind != crate::analytics::SessionKindFilter::All
     }
 
     fn home_chart_uses_search_results(&self) -> bool {
@@ -1384,6 +1389,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
+        let session_kind = self.session_kind;
         let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
@@ -1399,6 +1405,7 @@ impl App {
                         None,
                         project.as_deref(),
                         project_grouping,
+                        Some(session_kind),
                     )?;
                     Ok((
                         rows.into_iter()
@@ -1423,6 +1430,7 @@ impl App {
                         project_grouping,
                         since_ms,
                         until_ms: None,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(points, partial)| {
@@ -1628,6 +1636,11 @@ impl App {
                 options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
                 options
             }
+            HomeDropdown::Kind => vec![
+                "primary".to_string(),
+                "all".to_string(),
+                "subagent".to_string(),
+            ],
             HomeDropdown::Project => {
                 let mut options = vec!["all projects".to_string()];
                 options.extend(self.home_projects.iter().cloned());
@@ -1658,6 +1671,11 @@ impl App {
                 .position(|s| *s == self.source)
                 .map(|idx| idx + 1)
                 .unwrap_or(0),
+            HomeDropdown::Kind => match self.session_kind {
+                crate::analytics::SessionKindFilter::Primary => 0,
+                crate::analytics::SessionKindFilter::All => 1,
+                crate::analytics::SessionKindFilter::Subagent => 2,
+            },
             HomeDropdown::Project => self
                 .home_projects
                 .iter()
@@ -1695,6 +1713,8 @@ impl App {
         let previous_machine = self.machine.clone();
         let source_selection = self.home_dropdown == HomeDropdown::Source;
         let previous_source = self.source;
+        let kind_selection = self.home_dropdown == HomeDropdown::Kind;
+        let previous_kind = self.session_kind;
         let project_selection = self.home_dropdown == HomeDropdown::Project;
         let previous_project = self.project.clone();
         let refresh_search = match self.home_dropdown {
@@ -1724,6 +1744,15 @@ impl App {
                 };
                 true
             }
+            HomeDropdown::Kind => {
+                self.session_kind = match idx {
+                    0 => crate::analytics::SessionKindFilter::Primary,
+                    1 => crate::analytics::SessionKindFilter::All,
+                    2 => crate::analytics::SessionKindFilter::Subagent,
+                    _ => crate::analytics::SessionKindFilter::Primary,
+                };
+                true
+            }
             HomeDropdown::Project => {
                 self.project = if idx == 0 {
                     String::new()
@@ -1736,6 +1765,7 @@ impl App {
         };
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
+        let kind_changed = kind_selection && self.session_kind != previous_kind;
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
         let token_filter_changed = machine_changed || source_changed || project_changed;
@@ -1744,7 +1774,7 @@ impl App {
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed {
+            if token_filter_changed || kind_changed {
                 self.kickoff_home_activity();
             }
         } else if refresh_activity {
@@ -3004,6 +3034,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Esc => {
                 app.close_home_dropdown();
             }
+            KeyCode::Char('k') | KeyCode::Char('c') | KeyCode::Char('K')
+                if app.home_dropdown == HomeDropdown::Kind =>
+            {
+                app.close_home_dropdown();
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 app.move_home_dropdown_selection(-1);
             }
@@ -3105,11 +3140,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
         }
+        KeyCode::Char('c') | KeyCode::Char('K') => {
+            app.open_home_dropdown(HomeDropdown::Kind);
+        }
         KeyCode::Char('p') => {
             app.open_home_dropdown(HomeDropdown::Project);
-        }
-        KeyCode::Char('K') => {
-            app.cycle_session_kind();
         }
         KeyCode::Char('S') => {
             let _ = app.share_selected();
@@ -3200,6 +3235,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     app.home_range_area = Rect::default();
     app.home_machine_area = Rect::default();
     app.home_source_area = Rect::default();
+    app.home_kind_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
     if area.width < 8 || area.height < 4 {
@@ -3382,7 +3418,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     y += 4;
 
-    // Header row: label on the left, machine/source/project dropdown anchors on the right.
+    // Header row: label on the left, machine/source/kind/project dropdown anchors on the right.
     let searching = !app.query.trim().is_empty();
     let header_area = col(y, 1);
     let mut header_spans = vec![Span::styled(
@@ -3408,6 +3444,14 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         String::new()
     };
     let source_word = format!("{} ▾", app.source.label());
+    let kind_word = format!(
+        "{} ▾",
+        match app.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::All => "all kinds",
+            crate::analytics::SessionKindFilter::Subagent => "subagents",
+        }
+    );
     let project_word = format!(
         "{} ▾",
         if app.project.trim().is_empty() {
@@ -3418,6 +3462,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
+    let kind_width = kind_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3427,12 +3472,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Constraint::Length(if machine_width > 0 { 3 } else { 0 }),
             Constraint::Length(source_width),
             Constraint::Length(3),
+            Constraint::Length(kind_width),
+            Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
         .split(header_area);
     app.home_machine_area = header_cols[1];
     app.home_source_area = header_cols[3];
-    app.home_project_area = header_cols[5];
+    app.home_kind_area = header_cols[5];
+    app.home_project_area = header_cols[7];
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
     let machine_style = if app.machine.is_empty() {
         theme.muted
@@ -3440,6 +3488,11 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         theme.accent
     };
     let source_style = if app.source == SourceChoice::All {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    let kind_style = if app.session_kind == crate::analytics::SessionKindFilter::All {
         theme.muted
     } else {
         theme.accent
@@ -3460,8 +3513,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         header_cols[3],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        Paragraph::new(Line::from(Span::styled(kind_word, kind_style))),
         header_cols[5],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        header_cols[7],
     );
     y += 1;
 
@@ -3535,20 +3592,19 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
         HomeDropdown::Range => app.home_range_area,
         HomeDropdown::Machine => app.home_machine_area,
         HomeDropdown::Source => app.home_source_area,
+        HomeDropdown::Kind => app.home_kind_area,
         HomeDropdown::Project => app.home_project_area,
         HomeDropdown::None => Rect::default(),
     };
     if anchor.width == 0 {
         return;
     }
-    let width = options
-        .iter()
-        .map(|o| o.chars().count())
-        .max()
-        .unwrap_or(8)
-        .clamp(8, 32) as u16
-        + 2;
-    let width = width.min(area.width);
+    let max_len = if app.home_dropdown == HomeDropdown::Kind {
+        38
+    } else {
+        options.iter().map(|o| o.chars().count()).max().unwrap_or(8)
+    };
+    let width = ((max_len as u16).clamp(8, 42) + 2).min(area.width);
     let x = anchor
         .right()
         .saturating_sub(width)
@@ -3571,10 +3627,27 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
     app.home_dropdown_area = popup;
     frame.render_widget(Clear, popup);
     frame.render_widget(Block::default().style(theme.panel_alt), popup);
-    let items: Vec<ListItem> = options
-        .into_iter()
-        .map(|option| ListItem::new(Line::from(Span::styled(format!(" {option}"), theme.text))))
-        .collect();
+    let items: Vec<ListItem> = if app.home_dropdown == HomeDropdown::Kind {
+        let kind_items = [
+            ("primary", "primary interactive sessions"),
+            ("all", "all sessions"),
+            ("subagent", "subagent sessions only"),
+        ];
+        kind_items
+            .into_iter()
+            .map(|(label, desc)| {
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!(" {label}"), theme.text_bold),
+                    Span::styled(format!("  {desc}"), theme.muted),
+                ]))
+            })
+            .collect()
+    } else {
+        options
+            .into_iter()
+            .map(|option| ListItem::new(Line::from(Span::styled(format!(" {option}"), theme.text))))
+            .collect()
+    };
     let list = List::new(items)
         .style(theme.text)
         .highlight_style(theme.selection)
@@ -4843,7 +4916,7 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
             crate::analytics::SessionKindFilter::All => "all",
         };
         right_spans.push(Span::styled("kind ", theme.muted));
-        right_spans.push(Span::styled("(K) ", theme.accent));
+        right_spans.push(Span::styled("(c/K) ", theme.accent));
         right_spans.push(Span::styled(kind_label, theme.text));
         right_spans.push(Span::raw("   "));
     }
@@ -4942,10 +5015,10 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" timeframe  ", theme.muted),
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
+            Span::styled("c", theme.accent),
+            Span::styled(" kind  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
-            Span::styled("K", theme.accent),
-            Span::styled(" kind  ", theme.muted),
             Span::styled("/", theme.accent),
             Span::styled(" search  ", theme.muted),
             Span::styled("tab", theme.accent),
@@ -5413,6 +5486,9 @@ fn add_record_to_session(
             conversation_kind: label.clone(),
         });
     entry.hit_count += 1;
+    if entry.conversation_kind.is_none() && record.links.conversation_kind.is_some() {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     if record.ts > entry.last_ts {
         entry.last_ts = record.ts;
     }
@@ -5457,6 +5533,9 @@ fn add_located_record_to_session(
         conversation_kind: record.links.conversation_kind.clone(),
     });
     entry.hit_count += 1;
+    if entry.conversation_kind.is_none() && record.links.conversation_kind.is_some() {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
@@ -5720,6 +5799,7 @@ fn build_detail_lines_from_records(
             format!("{}:{}", session.machine, session.source.label())
         },
         session_id: session.session_id.clone(),
+        kind: session.conversation_kind.clone(),
     }];
     if records.is_empty() {
         lines.push(PreviewLine::Text("no records in session".to_string()));
@@ -6371,16 +6451,25 @@ fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
             project,
             source,
             session_id,
-        } => Line::from(vec![
-            Span::styled("project ", theme.muted),
-            Span::styled(project.as_str(), theme.accent),
-            Span::raw("  "),
-            Span::styled("source ", theme.muted),
-            Span::styled(source.as_str(), theme.muted),
-            Span::raw("  "),
-            Span::styled("session ", theme.muted),
-            Span::styled(session_id.as_str(), theme.text),
-        ]),
+            kind,
+        } => {
+            let mut spans = vec![
+                Span::styled("project ", theme.muted),
+                Span::styled(project.as_str(), theme.accent),
+                Span::raw("  "),
+                Span::styled("source ", theme.muted),
+                Span::styled(source.as_str(), theme.muted),
+                Span::raw("  "),
+                Span::styled("session ", theme.muted),
+                Span::styled(session_id.as_str(), theme.text),
+            ];
+            if let Some(kind_str) = kind.as_deref().filter(|s| !s.is_empty()) {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("kind ", theme.muted));
+                spans.push(Span::styled(kind_str, theme.accent));
+            }
+            Line::from(spans)
+        }
         PreviewLine::Meta {
             role,
             ts,
@@ -6700,6 +6789,8 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
                 app.open_home_dropdown(HomeDropdown::Machine);
             } else if app.home_source_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Source);
+            } else if app.home_kind_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Kind);
             } else if app.home_project_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Project);
             } else if app.home_list_area.contains(pos) && app.home_list_area.height > 0 {
@@ -7373,6 +7464,7 @@ mod tests {
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
 
         app.source = SourceChoice::All;
+        app.session_kind = crate::analytics::SessionKindFilter::All;
         app.config.machines.push(crate::config::MachineConfig {
             id: "mini".to_string(),
             label: None,
@@ -7384,6 +7476,9 @@ mod tests {
         });
         assert!(!app.home_chart_is_filtered());
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
+
+        app.session_kind = crate::analytics::SessionKindFilter::Primary;
+        assert!(app.home_chart_is_filtered());
     }
 
     #[test]
@@ -7721,6 +7816,20 @@ mod tests {
         app.move_home_dropdown_selection(2);
         app.apply_home_dropdown();
         assert_eq!(app.source, SourceChoice::Codex);
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_applies_selection() {
+        let (_tmp, mut app) = test_app();
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        app.move_home_dropdown_selection(2);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
         assert_eq!(app.home_dropdown, HomeDropdown::None);
     }
 
