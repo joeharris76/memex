@@ -3034,9 +3034,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Esc => {
                 app.close_home_dropdown();
             }
-            KeyCode::Char('k') | KeyCode::Char('c') | KeyCode::Char('K')
-                if app.home_dropdown == HomeDropdown::Kind =>
-            {
+            // `c`/`K` toggle the kind dropdown closed; `k` must keep moving
+            // the selection up like in every other dropdown.
+            KeyCode::Char('c') | KeyCode::Char('K') if app.home_dropdown == HomeDropdown::Kind => {
                 app.close_home_dropdown();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -7830,6 +7830,33 @@ mod tests {
             app.session_kind,
             crate::analytics::SessionKindFilter::Subagent
         );
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_dropdown_k_navigates_instead_of_closing() {
+        let (_tmp, mut app) = test_app();
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("devnull");
+        let mut terminal = Terminal::new(CrosstermBackend::new(devnull)).expect("terminal");
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        // `j` moves down like in every other dropdown.
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        // `k` moves back up and leaves the dropdown open.
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(0));
+        // `c` toggles the kind dropdown closed.
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
         assert_eq!(app.home_dropdown, HomeDropdown::None);
     }
 

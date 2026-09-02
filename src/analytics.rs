@@ -889,6 +889,10 @@ impl AnalyticsWriter {
                     conversation_kind = COALESCE(excluded.conversation_kind, sessions.conversation_kind)
                 "#,
             )?;
+            // OpenCode title/agent lookups hit the source SQLite database. Sessions
+            // from one database share the same file, so memoize per flush to
+            // avoid reopening it once per session during large index scans.
+            let mut opencode_cache = OpencodeLookupCache::default();
             for (session, metadata) in sessions {
                 let label = extract_session_label(
                     session.key.source,
@@ -896,6 +900,7 @@ impl AnalyticsWriter {
                     &session.key.session_id,
                     session.first_user_text.as_deref(),
                     metadata.cwd.as_deref(),
+                    &mut opencode_cache,
                 );
                 let conversation_kind = infer_session_kind(
                     session.key.source,
@@ -904,6 +909,7 @@ impl AnalyticsWriter {
                     session.conversation_kind.as_deref(),
                     metadata.cwd.as_deref(),
                     session.first_user_text.as_deref(),
+                    &mut opencode_cache,
                 );
                 stmt.execute(params![
                     session.key.source.storage_label(),
@@ -1640,16 +1646,42 @@ fn opencode_agent_is_subagent(db_path: &str, session_id: &str) -> bool {
     check().unwrap_or(false)
 }
 
+/// Memoized OpenCode source-database lookups for one flush. Titles and agent
+/// names are immutable per session, so caching across the sessions of a flush
+/// only collapses repeated reads of the same row.
+#[derive(Default)]
+struct OpencodeLookupCache {
+    titles: HashMap<(String, String), Option<String>>,
+    subagent: HashMap<(String, String), bool>,
+}
+
+impl OpencodeLookupCache {
+    fn title(&mut self, db_path: &str, session_id: &str) -> Option<String> {
+        self.titles
+            .entry((db_path.to_string(), session_id.to_string()))
+            .or_insert_with(|| opencode_title_for_session(db_path, session_id))
+            .clone()
+    }
+
+    fn is_subagent(&mut self, db_path: &str, session_id: &str) -> bool {
+        *self
+            .subagent
+            .entry((db_path.to_string(), session_id.to_string()))
+            .or_insert_with(|| opencode_agent_is_subagent(db_path, session_id))
+    }
+}
+
 fn extract_session_label(
     source: SourceKind,
     source_path: &str,
     session_id: &str,
     first_user_text: Option<&str>,
     _cwd: Option<&str>,
+    opencode: &mut OpencodeLookupCache,
 ) -> Option<String> {
     let raw = match source {
         SourceKind::Opencode => {
-            if let Some(title) = opencode_title_for_session(source_path, session_id)
+            if let Some(title) = opencode.title(source_path, session_id)
                 && !title.trim().is_empty()
             {
                 title
@@ -1686,6 +1718,7 @@ fn infer_session_kind(
     initial_kind: Option<&str>,
     cwd: Option<&str>,
     first_user_text: Option<&str>,
+    opencode: &mut OpencodeLookupCache,
 ) -> Option<String> {
     if let Some(kind) = initial_kind
         && kind != "main"
@@ -1715,13 +1748,13 @@ fn infer_session_kind(
             }
         }
         SourceKind::Opencode => {
-            if opencode_agent_is_subagent(source_path, session_id) {
+            if opencode.is_subagent(source_path, session_id) {
                 return Some("subagent".to_string());
             }
         }
         SourceKind::Muse => {
             let normalized = source_path.replace('\\', "/");
-            if normalized.contains("/subagent/") {
+            if normalized.contains("/subagent/") || normalized.contains("/subagents/") {
                 return Some("subagent".to_string());
             }
         }
@@ -1732,8 +1765,14 @@ fn infer_session_kind(
             }
         }
         SourceKind::Cursor => {
+            // Match whole path components (like the Cursor parser's
+            // `is_subagent_transcript`): a bare substring would false-positive
+            // on projects such as `my-subagents-tool`.
             let normalized = source_path.replace('\\', "/");
-            if normalized.contains("/subagents/") || normalized.contains("subagents") {
+            if normalized
+                .split('/')
+                .any(|c| c == "subagents" || c == "subagent")
+            {
                 return Some("subagent".to_string());
             }
         }
@@ -2413,6 +2452,7 @@ mod tests {
             Some("main"),
             Some("/tmp/work"),
             Some("hello"),
+            &mut OpencodeLookupCache::default(),
         );
         assert_eq!(kind.as_deref(), Some("subagent"));
         let kind2 = infer_session_kind(
@@ -2422,7 +2462,97 @@ mod tests {
             Some("main"),
             Some("/Users/joe/Code/memex"),
             Some("hello"),
+            &mut OpencodeLookupCache::default(),
         );
         assert_eq!(kind2.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn strip_ansi_preserves_multibyte_unicode() {
+        let label = sanitize_label("Fix the 🚀 deploy \x1b[31mred\x1b[0m pipeline ✅ now");
+        assert_eq!(label, "Fix the 🚀 deploy red pipeline ✅ now");
+        assert!(label.contains('🚀'));
+    }
+
+    #[test]
+    fn sanitize_label_truncates_unicode_by_chars_not_bytes() {
+        let raw = "🚀".repeat(200);
+        let label = sanitize_label(&raw);
+        assert!(label.chars().count() <= MAX_LABEL_CHARS);
+        assert!(label.contains('…'));
+        assert!(label.starts_with("🚀"));
+    }
+
+    #[test]
+    fn sanitize_label_with_unicode_case_fold_before_tag_does_not_panic() {
+        // U+0130 folds to 2 chars on lowercase; byte offsets computed on the
+        // folded copy would be wrong for the original. Must strip safely.
+        let raw = "İstanbul \u{130} <SYSTEM-REMINDER>hidden</SYSTEM-REMINDER> visible task";
+        let label = sanitize_label(raw);
+        assert!(!label.contains("hidden"));
+        assert!(!label.contains("SYSTEM-REMINDER"));
+        assert!(label.contains("visible task"));
+    }
+
+    #[test]
+    fn sanitize_label_preserves_lone_comparison_brackets() {
+        let raw = "a < b and c > d comparison";
+        let label = sanitize_label(raw);
+        assert_eq!(label, "a < b and c > d comparison");
+    }
+
+    #[test]
+    fn infer_session_kind_matches_cursor_path_components_only() {
+        let mut cache = OpencodeLookupCache::default();
+        // Bare substring must not classify: project merely mentions subagents.
+        let not_sub = infer_session_kind(
+            SourceKind::Cursor,
+            "/data/my-subagents-tool/session.json",
+            "session",
+            Some("main"),
+            None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(not_sub.as_deref(), Some("main"));
+        let is_sub = infer_session_kind(
+            SourceKind::Cursor,
+            "/data/Cursor/projects/subagents/agent-1/transcript.json",
+            "agent-1",
+            Some("main"),
+            None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(is_sub.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn infer_session_kind_matches_muse_plural_subagents_dir() {
+        let mut cache = OpencodeLookupCache::default();
+        let kind = infer_session_kind(
+            SourceKind::Muse,
+            "/data/muse/projects/p/subagents/abc123/stream.jsonl",
+            "abc123",
+            Some("main"),
+            None,
+            None,
+            &mut cache,
+        );
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn extract_session_label_falls_back_without_opencode_db() {
+        let mut cache = OpencodeLookupCache::default();
+        let label = extract_session_label(
+            SourceKind::Opencode,
+            "/nonexistent/opencode.db",
+            "missing",
+            Some("  hello world  "),
+            None,
+            &mut cache,
+        );
+        assert_eq!(label.as_deref(), Some("hello world"));
     }
 }

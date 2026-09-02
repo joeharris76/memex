@@ -457,7 +457,7 @@ EXAMPLES:
         #[arg(long, value_enum, default_value_t = SessionKind::All)]
         kind: SessionKind,
         /// Only show primary (interactive) sessions (alias for --kind primary)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "kind")]
         primary_only: bool,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
@@ -4889,6 +4889,18 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    #[test]
+    fn sessions_primary_only_conflicts_with_explicit_kind() {
+        assert!(
+            Cli::try_parse_from(["memex", "sessions", "--kind", "subagent", "--primary-only"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["memex", "sessions", "--primary-only"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "subagent"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
+    }
 
     #[test]
     fn build_index_command_args_preserves_disabled_sources() {
