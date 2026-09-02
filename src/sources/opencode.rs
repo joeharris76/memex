@@ -225,6 +225,7 @@ pub struct OpencodeSession {
     pub directory: String,
     pub time_created: u64,
     pub time_updated: u64,
+    pub agent: Option<String>,
 }
 
 /// Enumerate the modern session inventory from one OpenCode database.
@@ -259,6 +260,7 @@ fn enumerate_sessions_from_connection(
         })
         .with_context(|| format!("query OpenCode sessions in {}", path.display()))?;
     let mut sessions = Vec::new();
+    let agents = session_agents(connection);
     for row in rows {
         let (id, parent_id, directory, time_created, time_updated) = row?;
         sessions.push(OpencodeSession {
@@ -269,9 +271,35 @@ fn enumerate_sessions_from_connection(
                 .with_context(|| format!("session `{id}` has invalid time_created"))?,
             time_updated: nonnegative_timestamp(time_updated)
                 .with_context(|| format!("session `{id}` has invalid time_updated"))?,
+            agent: agents.get(&id).cloned(),
         });
     }
     Ok(sessions)
+}
+
+/// Tolerantly load the `agent` column for subagent detection (`agent != 'build'`).
+/// Older databases may lack the column; in that case every session reports `None`
+/// and callers fall back to parent-id-only classification.
+fn session_agents(connection: &Connection) -> HashMap<String, String> {
+    let mut agents = HashMap::new();
+    let Ok(mut statement) = connection.prepare("SELECT id, agent FROM session") else {
+        return agents;
+    };
+    let Ok(rows) = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Option<String>>(1)?,
+        ))
+    }) else {
+        return agents;
+    };
+    for row in rows.flatten() {
+        let (id, agent) = row;
+        if let Some(agent) = agent.filter(|a| !a.is_empty()) {
+            agents.insert(id, agent);
+        }
+    }
+    agents
 }
 
 fn nonnegative_timestamp(value: i64) -> Result<u64> {
@@ -727,6 +755,8 @@ pub(crate) fn parse_database_records(
         thread_source: session.parent_id.as_ref().map(|_| "fork".to_string()),
         conversation_kind: Some(if session.parent_id.is_some() {
             "fork".to_string()
+        } else if session.agent.as_deref().is_some_and(|a| a != "build") {
+            "subagent".to_string()
         } else {
             "main".to_string()
         }),
@@ -876,6 +906,16 @@ fn enumerate_session_from_connection(
         return Ok(None);
     };
     let (id, parent_id, directory, time_created, time_updated) = row;
+    let agent = connection
+        .query_row(
+            "SELECT agent FROM session WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()
+        .unwrap_or(None)
+        .flatten()
+        .filter(|a| !a.is_empty());
     Ok(Some(OpencodeSession {
         id,
         parent_id,
@@ -884,6 +924,7 @@ fn enumerate_session_from_connection(
             .with_context(|| format!("session `{session_id}` has invalid time_created"))?,
         time_updated: nonnegative_timestamp(time_updated)
             .with_context(|| format!("session `{session_id}` has invalid time_updated"))?,
+        agent,
     }))
 }
 
