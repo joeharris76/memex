@@ -20,7 +20,9 @@ use std::sync::{Arc, Mutex};
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 4,
+    // Bumped for role-string subagent source detection: forces a full
+    // re-parse so stored kinds are recomputed on next index.
+    index: 5,
     usage: 4,
 };
 
@@ -218,10 +220,17 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
         .get("forked_from_id")
         .and_then(|value| value.as_str())
         .map(str::to_string);
-    let parent_thread_id = payload
+    // Older CLIs record spawned agents as `"source": {"subagent": "<role>"}`
+    // with no `thread_spawn` wrapper or explicit `thread_source`; any
+    // object- or role-string-shaped marker means this thread is a subagent.
+    let subagent_marker = payload
         .get("source")
         .and_then(|value| value.as_object())
-        .and_then(|source| source.get("subagent"))
+        .and_then(|source| source.get("subagent"));
+    let subagent_present = subagent_marker.is_some_and(|marker| {
+        marker.as_object().is_some() || marker.as_str().is_some_and(|role| !role.is_empty())
+    });
+    let parent_thread_id = subagent_marker
         .and_then(|value| value.as_object())
         .and_then(|subagent| subagent.get("thread_spawn"))
         .and_then(|value| value.as_object())
@@ -233,6 +242,7 @@ fn apply_meta(payload: &simd_json::borrowed::Object<'_>, metadata: &mut SessionM
         .and_then(|value| value.as_str())
         .map(str::to_string)
         .or_else(|| parent_thread_id.as_ref().map(|_| "subagent".to_string()))
+        .or_else(|| subagent_present.then(|| "subagent".to_string()))
         .or_else(|| forked_from_id.as_ref().map(|_| "fork".to_string()));
     metadata.links.parent_session_id = forked_from_id.clone().or(parent_thread_id);
     metadata.links.thread_source = thread_source.clone();
@@ -1533,6 +1543,27 @@ mod tests {
             ConversationKind::Subagent
         );
         assert_eq!(metadata.project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn probe_marks_role_string_subagent_source() {
+        // Older CLIs write `"source": {"subagent": "review"}` with neither
+        // `thread_spawn` nor an explicit `thread_source`.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join("rollout-2026-01-26T13-38-17-019bfb99-7735-77a0-8792-176cdc56fda7.jsonl");
+        fs::write(
+            &path,
+            "{\"type\":\"session_meta\",\"payload\":{\"id\":\"019bfb99-7735-77a0-8792-176cdc56fda7\",\"cwd\":\"/repo/memex\",\"source\":{\"subagent\":\"review\"}}}\n",
+        )
+        .unwrap();
+        let metadata = probe(&path).unwrap();
+        assert_eq!(
+            metadata.session.conversation_kind,
+            ConversationKind::Subagent
+        );
+        assert_eq!(metadata.session.parent_session_id, None);
     }
 
     #[test]

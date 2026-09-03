@@ -12,7 +12,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 1,
+    // Bumped for preamble-skipping subagent directive detection: forces a
+    // full re-parse so stored kinds/labels are recomputed on next index.
+    index: 2,
     usage: 1,
 };
 
