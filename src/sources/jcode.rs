@@ -12,10 +12,10 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    // Bumped for swarm-dialect directive detection (0 repo writes, deep
-    // validation): forces a full re-parse so stored kinds are recomputed
-    // on next index.
-    index: 3,
+    // Bumped for preamble-record exclusion: forces a full re-parse so
+    // stale preamble records are purged and preamble-only sessions drop
+    // out on next index.
+    index: 4,
     usage: 1,
 };
 
@@ -349,7 +349,11 @@ pub(crate) fn parse_index_records(
                     }
 
                     let full_text = text_parts.join("\n").trim().to_string();
-                    if !full_text.is_empty() {
+                    // Preamble-only messages (system context wrappers with no
+                    // real content) are dropped: they add no searchable value,
+                    // and a session containing nothing else yields zero
+                    // records, excluding it from the index altogether.
+                    if !sanitize_label(&full_text).is_empty() {
                         emit(Record {
                             source: SourceKind::Jcode,
                             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -777,6 +781,36 @@ mod tests {
             "Deep validation: Orchestration ORIGIN d7d518e STEADY ~255m at 07:50:05Z live triad. Read-only, 0 repo writes outside /tmp.",
         ]);
         assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn preamble_only_session_yields_no_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_empty.json");
+        let doc = serde_json::json!({
+            "id": "session_empty",
+            "parent_id": null,
+            "working_dir": "/Users/joe/Developer/BenchBox",
+            "messages": [
+                {"id": "m001", "role": "user", "timestamp": 1,
+                 "content": "<system-reminder>\n# Session Context\nDate: 2026-09-02\n</system-reminder>"},
+            ],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let mut records = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                records.push(rec);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(records.is_empty());
     }
 
     #[test]
