@@ -1747,6 +1747,8 @@ fn infer_session_kind(
                     || lower.contains("you are the downstream")
                     || lower.contains("implementation worker")
                     || lower.contains("investigation subagent")
+                    || lower.contains("0 repo writes")
+                    || lower.contains("deep validation:")
                 {
                     return Some("subagent".to_string());
                 }

@@ -12,9 +12,10 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    // Bumped for preamble-skipping subagent directive detection: forces a
-    // full re-parse so stored kinds/labels are recomputed on next index.
-    index: 2,
+    // Bumped for swarm-dialect directive detection (0 repo writes, deep
+    // validation): forces a full re-parse so stored kinds are recomputed
+    // on next index.
+    index: 3,
     usage: 1,
 };
 
@@ -224,6 +225,8 @@ pub(crate) fn parse_index_records(
                 || lower.contains("you are the downstream")
                 || lower.contains("implementation worker")
                 || lower.contains("investigation subagent")
+                || lower.contains("0 repo writes")
+                || lower.contains("deep validation:")
             {
                 conversation_kind = "subagent";
             }
@@ -759,6 +762,19 @@ mod tests {
         assert_eq!(kind.as_deref(), Some("subagent"));
         let kind = kind_for_user_texts(&[
             "You are an investigation subagent. In /Users/joe/Developer/BenchBox, triage the failure.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn fresh_cycle_and_validation_directives_are_subagent() {
+        let kind = kind_for_user_texts(&[
+            "<system-reminder>\n# Session Context\nDate: 2026-09-02\n</system-reminder>",
+            "FRESH 12:38Z definitive \u{2014} supersede wolf 183 authoritative: At live poll 12:38:43Z origin/develop STILL d7d518e. 0 repo writes.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+        let kind = kind_for_user_texts(&[
+            "Deep validation: Orchestration ORIGIN d7d518e STEADY ~255m at 07:50:05Z live triad. Read-only, 0 repo writes outside /tmp.",
         ]);
         assert_eq!(kind.as_deref(), Some("subagent"));
     }
