@@ -453,10 +453,10 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Filter by session kind: primary (interactive), subagent, or all
+        /// Filter by session origin: interactive, subagent, or all
         #[arg(long, value_enum, default_value_t = SessionKind::All)]
         kind: SessionKind,
-        /// Only show primary (interactive) sessions (alias for --kind primary)
+        /// Only show interactive sessions (alias for --kind interactive)
         #[arg(long, conflicts_with = "kind")]
         primary_only: bool,
         /// Emit one JSON array instead of JSON Lines
@@ -712,7 +712,7 @@ impl From<TransferMode> for CoreTransferMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
 enum SessionKind {
-    Primary,
+    Interactive,
     Subagent,
     All,
 }
@@ -720,7 +720,7 @@ enum SessionKind {
 impl From<SessionKind> for crate::analytics::SessionKindFilter {
     fn from(value: SessionKind) -> Self {
         match value {
-            SessionKind::Primary => crate::analytics::SessionKindFilter::Primary,
+            SessionKind::Interactive => crate::analytics::SessionKindFilter::Primary,
             SessionKind::Subagent => crate::analytics::SessionKindFilter::Subagent,
             SessionKind::All => crate::analytics::SessionKindFilter::All,
         }
@@ -1099,7 +1099,7 @@ pub fn run() -> Result<()> {
             root,
         } => {
             let kind = if primary_only {
-                SessionKind::Primary
+                SessionKind::Interactive
             } else {
                 kind
             };
@@ -4899,6 +4899,7 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["memex", "sessions", "--primary-only"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "subagent"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "interactive"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
     }
 

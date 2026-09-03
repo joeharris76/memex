@@ -1638,7 +1638,7 @@ impl App {
             }
             HomeDropdown::Kind => vec![
                 "all".to_string(),
-                "primary".to_string(),
+                "interactive".to_string(),
                 "subagent".to_string(),
             ],
             HomeDropdown::Project => {
@@ -1708,7 +1708,8 @@ impl App {
             self.close_home_dropdown();
             return;
         };
-        let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let range_selection = self.home_dropdown == HomeDropdown::Range;
+        let previous_range = self.home_activity_range;
         let machine_selection = self.home_dropdown == HomeDropdown::Machine;
         let previous_machine = self.machine.clone();
         let source_selection = self.home_dropdown == HomeDropdown::Source;
@@ -1723,7 +1724,10 @@ impl App {
                     .get(idx)
                     .copied()
                     .unwrap_or(TimelineRange::Month);
-                false
+                // The timeframe filters the chart and the recent list alike:
+                // sync the list's `since` bound (All clears it back to None).
+                self.sessions_since = self.home_activity_range.since_ms(now_ms());
+                true
             }
             HomeDropdown::Machine => {
                 self.machine = if idx == 0 {
@@ -1768,16 +1772,17 @@ impl App {
         let kind_changed = kind_selection && self.session_kind != previous_kind;
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
+        let range_changed = range_selection && self.home_activity_range != previous_range;
         let token_filter_changed = machine_changed || source_changed || project_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed || kind_changed {
+            if token_filter_changed || kind_changed || range_changed {
                 self.kickoff_home_activity();
             }
-        } else if refresh_activity {
+        } else if range_changed {
             self.kickoff_home_activity();
         }
     }
@@ -2317,7 +2322,7 @@ impl App {
             }
         };
         let label = match self.session_kind {
-            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::All => "all",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
         };
@@ -2964,7 +2969,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.kickoff_home_activity();
             }
         }
-        KeyCode::Char('K') => {
+        KeyCode::Char('c') => {
             app.cycle_session_kind();
         }
         KeyCode::Char('[') => {
@@ -3034,9 +3039,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             KeyCode::Esc => {
                 app.close_home_dropdown();
             }
-            // `c`/`K` toggle the kind dropdown closed; `k` must keep moving
+            // `c` toggles the kind dropdown closed; `k` must keep moving
             // the selection up like in every other dropdown.
-            KeyCode::Char('c') | KeyCode::Char('K') if app.home_dropdown == HomeDropdown::Kind => {
+            KeyCode::Char('c') if app.home_dropdown == HomeDropdown::Kind => {
                 app.close_home_dropdown();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3140,7 +3145,7 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
         }
-        KeyCode::Char('c') | KeyCode::Char('K') => {
+        KeyCode::Char('c') => {
             app.open_home_dropdown(HomeDropdown::Kind);
         }
         KeyCode::Char('p') => {
@@ -3444,12 +3449,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         String::new()
     };
     let source_word = format!("{} ▾", app.source.label());
-    let kind_word = format!(
+    let origin_word = format!(
         "{} ▾",
         match app.session_kind {
-            crate::analytics::SessionKindFilter::Primary => "primary",
-            crate::analytics::SessionKindFilter::All => "all kinds",
-            crate::analytics::SessionKindFilter::Subagent => "subagents",
+            crate::analytics::SessionKindFilter::Primary => "interactive",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
         }
     );
     let project_word = format!(
@@ -3462,7 +3467,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
-    let kind_width = kind_word.chars().count() as u16;
+    let origin_width = origin_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3472,7 +3477,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Constraint::Length(if machine_width > 0 { 3 } else { 0 }),
             Constraint::Length(source_width),
             Constraint::Length(3),
-            Constraint::Length(kind_width),
+            Constraint::Length(origin_width),
             Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
@@ -3513,7 +3518,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         header_cols[3],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(kind_word, kind_style))),
+        Paragraph::new(Line::from(Span::styled(origin_word, kind_style))),
         header_cols[5],
     );
     frame.render_widget(
@@ -3599,11 +3604,7 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
     if anchor.width == 0 {
         return;
     }
-    let max_len = if app.home_dropdown == HomeDropdown::Kind {
-        38
-    } else {
-        options.iter().map(|o| o.chars().count()).max().unwrap_or(8)
-    };
+    let max_len = options.iter().map(|o| o.chars().count()).max().unwrap_or(8);
     let width = ((max_len as u16).clamp(8, 42) + 2).min(area.width);
     let x = anchor
         .right()
@@ -3627,27 +3628,10 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
     app.home_dropdown_area = popup;
     frame.render_widget(Clear, popup);
     frame.render_widget(Block::default().style(theme.panel_alt), popup);
-    let items: Vec<ListItem> = if app.home_dropdown == HomeDropdown::Kind {
-        let kind_items = [
-            ("all", "all sessions"),
-            ("primary", "primary interactive sessions"),
-            ("subagent", "subagent sessions only"),
-        ];
-        kind_items
-            .into_iter()
-            .map(|(label, desc)| {
-                ListItem::new(Line::from(vec![
-                    Span::styled(format!(" {label}"), theme.text_bold),
-                    Span::styled(format!("  {desc}"), theme.muted),
-                ]))
-            })
-            .collect()
-    } else {
-        options
-            .into_iter()
-            .map(|option| ListItem::new(Line::from(Span::styled(format!(" {option}"), theme.text))))
-            .collect()
-    };
+    let items: Vec<ListItem> = options
+        .into_iter()
+        .map(|option| ListItem::new(Line::from(Span::styled(format!(" {option}"), theme.text))))
+        .collect();
     let list = List::new(items)
         .style(theme.text)
         .highlight_style(theme.selection)
@@ -4911,12 +4895,12 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         || app.layout_mode == LayoutMode::Split
     {
         let kind_label = match app.session_kind {
-            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
             crate::analytics::SessionKindFilter::All => "all",
         };
-        right_spans.push(Span::styled("kind ", theme.muted));
-        right_spans.push(Span::styled("(c/K) ", theme.accent));
+        right_spans.push(Span::styled("origin ", theme.muted));
+        right_spans.push(Span::styled("(c) ", theme.accent));
         right_spans.push(Span::styled(kind_label, theme.text));
         right_spans.push(Span::raw("   "));
     }
@@ -5016,7 +5000,7 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
             Span::styled("c", theme.accent),
-            Span::styled(" kind  ", theme.muted),
+            Span::styled(" origin  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
             Span::styled("/", theme.accent),
@@ -6465,7 +6449,7 @@ fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
             ];
             if let Some(kind_str) = kind.as_deref().filter(|s| !s.is_empty()) {
                 spans.push(Span::raw("  "));
-                spans.push(Span::styled("kind ", theme.muted));
+                spans.push(Span::styled("origin ", theme.muted));
                 spans.push(Span::styled(kind_str, theme.accent));
             }
             Line::from(spans)
@@ -7840,7 +7824,7 @@ mod tests {
         app.open_home_dropdown(HomeDropdown::Kind);
         assert_eq!(
             app.home_dropdown_options(),
-            vec!["all", "primary", "subagent"]
+            vec!["all", "interactive", "subagent"]
         );
     }
 
@@ -7899,7 +7883,7 @@ mod tests {
     }
 
     #[test]
-    fn range_dropdown_changes_chart_without_restarting_search() {
+    fn range_dropdown_filters_list_and_chart() {
         let (_tmp, mut app) = test_app();
         app.active_search_request = 7;
         app.open_home_dropdown(HomeDropdown::Range);
@@ -7908,9 +7892,20 @@ mod tests {
         app.move_home_dropdown_selection(1);
         app.apply_home_dropdown();
 
+        // "All" clears the list's `since` bound and restarts the search.
         assert_eq!(app.home_activity_range, TimelineRange::All);
-        assert_eq!(app.active_search_request, 7);
+        assert_eq!(app.sessions_since, None);
+        assert_ne!(app.active_search_request, 7);
         assert_eq!(app.home_activity_state, LoadState::Loading);
+
+        // A bounded range syncs the list's `since` bound to the same cutoff.
+        app.open_home_dropdown(HomeDropdown::Range);
+        app.move_home_dropdown_selection(-2);
+        app.apply_home_dropdown();
+        assert_eq!(app.home_activity_range, TimelineRange::Week);
+        let since = app.sessions_since.expect("bounded range sets since");
+        let now = now_ms();
+        assert!(since <= now && since > now.saturating_sub(8 * 86_400_000));
     }
 
     #[test]
