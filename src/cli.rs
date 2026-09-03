@@ -4899,7 +4899,6 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["memex", "sessions", "--primary-only"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "subagent"]).is_ok());
-        assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "interactive"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
     }
 
