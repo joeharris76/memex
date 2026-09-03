@@ -729,7 +729,7 @@ mod tests {
         let doc = serde_json::json!({
             "id": "session_probe",
             "parent_id": null,
-            "working_dir": "/Users/joe/Developer/BenchBox",
+            "working_dir": "/repo/example",
             "messages": messages,
         });
         std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
@@ -765,7 +765,7 @@ mod tests {
         ]);
         assert_eq!(kind.as_deref(), Some("subagent"));
         let kind = kind_for_user_texts(&[
-            "You are an investigation subagent. In /Users/joe/Developer/BenchBox, triage the failure.",
+            "You are an investigation subagent. In /repo/example, triage the failure.",
         ]);
         assert_eq!(kind.as_deref(), Some("subagent"));
     }
@@ -790,7 +790,7 @@ mod tests {
         let doc = serde_json::json!({
             "id": "session_empty",
             "parent_id": null,
-            "working_dir": "/Users/joe/Developer/BenchBox",
+            "working_dir": "/repo/example",
             "messages": [
                 {"id": "m001", "role": "user", "timestamp": 1,
                  "content": "<system-reminder>\n# Session Context\nDate: 2026-09-02\n</system-reminder>"},
