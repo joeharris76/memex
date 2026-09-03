@@ -5275,11 +5275,7 @@ fn sessions_from_analytics_filtered(
 }
 
 fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Option<&str>) -> bool {
-    match filter {
-        crate::analytics::SessionKindFilter::All => true,
-        crate::analytics::SessionKindFilter::Primary => kind.is_none() || kind == Some("main"),
-        crate::analytics::SessionKindFilter::Subagent => kind.is_some() && kind != Some("main"),
-    }
+    filter.matches_kind(kind)
 }
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
@@ -5470,7 +5466,12 @@ fn add_record_to_session(
             conversation_kind: label.clone(),
         });
     entry.hit_count += 1;
-    if entry.conversation_kind.is_none() && record.links.conversation_kind.is_some() {
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
         entry.conversation_kind = record.links.conversation_kind.clone();
     }
     if record.ts > entry.last_ts {
@@ -5517,7 +5518,12 @@ fn add_located_record_to_session(
         conversation_kind: record.links.conversation_kind.clone(),
     });
     entry.hit_count += 1;
-    if entry.conversation_kind.is_none() && record.links.conversation_kind.is_some() {
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
         entry.conversation_kind = record.links.conversation_kind.clone();
     }
     entry.last_ts = entry.last_ts.max(record.ts);
@@ -5681,13 +5687,13 @@ fn run_search_request(
     } else {
         None
     };
-    // The kind filter runs after retrieval caps the candidate list, so a
-    // filtered subset could starve the result list. Over-fetch while a subset
-    // is selected, then retain and truncate back to the display cap.
-    let query_limit = if matches!(request.kind, crate::analytics::SessionKindFilter::All) {
+<    // Over-fetch when an origin filter is active: the kind filter applies
+    // after grouping, so capping the record query at RESULT_LIMIT first
+    // could starve interactive matches in subagent-heavy corpora.
+    let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {
         RESULT_LIMIT
     } else {
-        RESULT_LIMIT.saturating_mul(5)
+        RESULT_LIMIT * 5
     };
     let mut sessions = sessions_from_query(
         index,
@@ -5695,7 +5701,7 @@ fn run_search_request(
         request.source.as_filter(),
         tantivy_project,
         request.since,
-        query_limit,
+        record_limit,
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
@@ -7112,6 +7118,23 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn grouped_session_prefers_main_over_side_records() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut side = record("assistant", "sidechain output");
+        side.links.conversation_kind = Some("sidechain".to_string());
+        add_record_to_session(&mut sessions, 1.0, side);
+        let mut main = record("user", "please fix the parser");
+        main.links.conversation_kind = Some("main".to_string());
+        add_record_to_session(&mut sessions, 0.5, main);
+        let summary = sessions.get("session").expect("grouped");
+        assert_eq!(summary.conversation_kind.as_deref(), Some("main"));
+        assert!(session_matches_kind(
+            crate::analytics::SessionKindFilter::Primary,
+            summary.conversation_kind.as_deref()
+        ));
     }
 
     fn markdown_perf_records() -> Vec<Record> {

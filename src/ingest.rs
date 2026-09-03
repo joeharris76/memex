@@ -240,13 +240,11 @@ fn prepare_file_task(
             previous.pending_tool_calls.clone(),
             true,
         ),
-        // Jcode sessions are whole JSON documents, not appendable JSONL: any change
-        // must delete existing records and re-index from scratch, otherwise the
-        // parser (which replays the full messages array) would duplicate history.
-        Some(previous) if source == SourceKind::Jcode => {
-            let _ = previous;
-            (0, 0, true, HashMap::new(), false)
-        }
+<        // A jcode session is one JSON object, so a byte offset cannot resume
+        // mid-file and the parser always emits from message zero. Reparse
+        // atomically instead: delete_first purges the stale rows first, so
+        // growing files can neither duplicate records nor inflate counts.
+        Some(_) if source == SourceKind::Jcode => (0, 0, true, HashMap::new(), false),
         Some(previous) => (
             previous.offset,
             previous.turn_id,
@@ -4425,6 +4423,46 @@ mod tests {
         assert!(task.parser_version_invalidated);
         assert_eq!(task.offset, 0);
         assert!(task.pending_tool_calls.is_empty());
+    }
+
+    #[test]
+    fn grown_jcode_file_reparses_atomically_instead_of_resuming() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session_jcode.json");
+        // Fabricate prior state for a smaller file with identical identity
+        // so only the jcode whole-object arm (not replacement detection)
+        // can explain atomic reparse.
+        fs::write(&path, "A".repeat(5100)).expect("transcript");
+        let metadata = path.metadata().expect("metadata");
+        let identity = file_identity(
+            &path,
+            &metadata,
+            metadata.len().min(FILE_IDENTITY_PREFIX_BYTES as u64) as usize,
+        );
+        let version = crate::sources::index_state_version(SourceKind::Jcode);
+        let mtime = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| duration.as_secs() as i64)
+            .unwrap_or(0);
+        let previous = FileState {
+            size: metadata.len() - 100,
+            mtime,
+            offset: metadata.len() - 100,
+            turn_id: 3,
+            parser_version: version,
+            pending_tool_calls: HashMap::new(),
+            identity,
+        };
+        let (task, skip) =
+            prepare_file_task(path, SourceKind::Jcode, false, &metadata, Some(&previous));
+        // Byte offsets cannot resume a single-JSON-object file: the parser
+        // re-emits from message zero, so the stale rows must go first.
+        assert!(!skip);
+        assert!(task.delete_first);
+        assert_eq!(task.offset, 0);
+        assert_eq!(task.turn_id, 0);
     }
 
     #[test]

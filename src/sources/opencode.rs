@@ -225,7 +225,6 @@ pub struct OpencodeSession {
     pub directory: String,
     pub time_created: u64,
     pub time_updated: u64,
-    pub agent: Option<String>,
 }
 
 /// Enumerate the modern session inventory from one OpenCode database.
@@ -260,7 +259,6 @@ fn enumerate_sessions_from_connection(
         })
         .with_context(|| format!("query OpenCode sessions in {}", path.display()))?;
     let mut sessions = Vec::new();
-    let agents = session_agents(connection);
     for row in rows {
         let (id, parent_id, directory, time_created, time_updated) = row?;
         sessions.push(OpencodeSession {
@@ -271,43 +269,13 @@ fn enumerate_sessions_from_connection(
                 .with_context(|| format!("session `{id}` has invalid time_created"))?,
             time_updated: nonnegative_timestamp(time_updated)
                 .with_context(|| format!("session `{id}` has invalid time_updated"))?,
-            agent: agents.get(&id).cloned(),
         });
     }
     Ok(sessions)
 }
 
-/// Tolerantly load the `agent` column for subagent detection (`agent != 'build'`).
-/// Older databases may lack the column; in that case every session reports `None`
-/// and callers fall back to parent-id-only classification.
-fn session_agents(connection: &Connection) -> HashMap<String, String> {
-    let mut agents = HashMap::new();
-    let Ok(mut statement) = connection.prepare("SELECT id, agent FROM session") else {
-        return agents;
-    };
-    let Ok(rows) = statement.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-    }) else {
-        return agents;
-    };
-    for row in rows.flatten() {
-        let (id, agent) = row;
-        if let Some(agent) = agent.filter(|a| !a.is_empty()) {
-            agents.insert(id, agent);
-        }
-    }
-    agents
-}
-
 fn nonnegative_timestamp(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| anyhow::anyhow!("negative timestamp"))
-}
-
-/// OpenCode's interactive primary agents. `plan` is a primary interactive mode,
-/// not a subagent, even though it is not `build`. Anything else recorded in
-/// the session `agent` column runs as a subagent.
-pub(crate) fn opencode_agent_is_primary(agent: Option<&str>) -> bool {
-    matches!(agent, None | Some("") | Some("build") | Some("plan"))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -754,13 +722,14 @@ pub(crate) fn parse_database_records(
             diagnostics: Default::default(),
         });
     };
+    // Parent linkage is the only subagent signal: the `agent` column records
+    // the selected agent (build/plan/custom), so a plan-mode session without
+    // a parent is still interactive.
     let links = SessionLinks {
         parent_session_id: session.parent_id.clone(),
         thread_source: session.parent_id.as_ref().map(|_| "fork".to_string()),
         conversation_kind: Some(if session.parent_id.is_some() {
             "fork".to_string()
-        } else if !opencode_agent_is_primary(session.agent.as_deref()) {
-            "subagent".to_string()
         } else {
             "main".to_string()
         }),
@@ -910,16 +879,6 @@ fn enumerate_session_from_connection(
         return Ok(None);
     };
     let (id, parent_id, directory, time_created, time_updated) = row;
-    let agent = connection
-        .query_row(
-            "SELECT agent FROM session WHERE id = ?1",
-            [session_id],
-            |row| row.get::<_, Option<String>>(0),
-        )
-        .optional()
-        .unwrap_or(None)
-        .flatten()
-        .filter(|a| !a.is_empty());
     Ok(Some(OpencodeSession {
         id,
         parent_id,
@@ -928,7 +887,6 @@ fn enumerate_session_from_connection(
             .with_context(|| format!("session `{session_id}` has invalid time_created"))?,
         time_updated: nonnegative_timestamp(time_updated)
             .with_context(|| format!("session `{session_id}` has invalid time_updated"))?,
-        agent,
     }))
 }
 
@@ -1245,13 +1203,40 @@ mod tests {
     }
 
     #[test]
-    fn plan_and_build_agents_are_primary() {
-        assert!(opencode_agent_is_primary(None));
-        assert!(opencode_agent_is_primary(Some("")));
-        assert!(opencode_agent_is_primary(Some("build")));
-        assert!(opencode_agent_is_primary(Some("plan")));
-        assert!(!opencode_agent_is_primary(Some("explore")));
-        assert!(!opencode_agent_is_primary(Some("custom-agent")));
+    fn plan_agent_without_parent_stays_main() {
+        // The `agent` column records the selected agent, not subagent-ness:
+        // only parent linkage classifies.
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("opencode.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE session (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL, time_created INTEGER NOT NULL, time_updated INTEGER NOT NULL, agent TEXT);
+                 INSERT INTO session VALUES ('ses_plan', NULL, '/repo/example', 1000, 1001, 'plan');
+                 INSERT INTO session VALUES ('ses_child', 'ses_plan', '/repo/example', 1002, 1003, 'general');
+                 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL, time_created INTEGER NOT NULL, data TEXT NOT NULL);
+                 INSERT INTO message VALUES ('msg_1', 'ses_plan', 1001, '{\"role\":\"user\"}');
+                 INSERT INTO message VALUES ('msg_2', 'ses_child', 1002, '{\"role\":\"user\"}');
+                 CREATE TABLE part (id TEXT PRIMARY KEY, message_id TEXT NOT NULL, data TEXT NOT NULL);
+                 INSERT INTO part VALUES ('part_1', 'msg_1', '{\"type\":\"text\",\"text\":\"Plan the work\"}');
+                 INSERT INTO part VALUES ('part_2', 'msg_2', '{\"type\":\"text\",\"text\":\"Do the work\"}');",
+            )
+            .unwrap();
+        drop(connection);
+
+        let plan = parse_database_session(&path, "ses_plan", 0, &AtomicU64::new(1)).unwrap();
+        assert_eq!(plan.len(), 1);
+        assert_eq!(
+            plan[0].links.conversation_kind.as_deref(),
+            Some("main")
+        );
+        let child =
+            parse_database_session(&path, "ses_child", 0, &AtomicU64::new(10)).unwrap();
+        assert_eq!(child.len(), 1);
+        assert_eq!(
+            child[0].links.conversation_kind.as_deref(),
+            Some("fork")
+        );
     }
 
     #[test]

@@ -1,6 +1,9 @@
 use super::{IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions, SourceFile};
 use crate::analytics::sanitize_label;
-use crate::types::{Record, RecordLinks, SourceKind};
+use crate::types::{
+    Record, RecordLinks, SourceKind, jcode_text_is_subagent_directive,
+    jcode_tmp_cwd_is_worker_sandbox,
+};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use simd_json::BorrowedValue;
@@ -131,6 +134,14 @@ fn timestamp_millis(value: &BorrowedValue<'_>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Resume origin for jcode parses. A session file is rewritten in place as
+/// a single JSON object, so no byte offset can resume mid-file: the parser
+/// always replays from this origin and ingest always pairs jcode with
+/// atomic delete-first reparse (see `prepare_file_task`). The reported
+/// output offset is the file length — a stored change marker, never a seek
+/// position — so `state.offset` is deliberately unread.
+pub(crate) const JCODE_PARSE_ORIGIN: u64 = 0;
+
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
@@ -147,7 +158,7 @@ pub(crate) fn parse_index_records(
     let Ok(value) = simd_json::to_borrowed_value(&mut bytes) else {
         diagnostics.malformed_json_lines += 1;
         return Ok(IndexParseOutput {
-            offset: 0,
+            offset: JCODE_PARSE_ORIGIN,
             turn_id: state.turn_id,
             pending_tool_calls: state.pending_tool_calls,
             session_id: Some(session_id_from_path(path)),
@@ -172,21 +183,21 @@ pub(crate) fn parse_index_records(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let mut conversation_kind = if parent_session_id.is_some()
-        || working_dir.starts_with("/tmp/")
-        || working_dir.starts_with("/private/tmp/")
-        || working_dir == "/tmp"
-        || working_dir == "/private/tmp"
-    {
-        "subagent"
-    } else {
-        "main"
-    };
+    // A bare /tmp working directory is not evidence on its own — users
+    // legitimately work in /tmp — so the tmp cue needs a worker-sandbox
+    // leaf name (see `crate::types::jcode_tmp_cwd_is_worker_sandbox`).
+    let mut conversation_kind =
+        if parent_session_id.is_some() || jcode_tmp_cwd_is_worker_sandbox(working_dir) {
+            "subagent"
+        } else {
+            "main"
+        };
     // Check directives in the first real user message for subagent hints.
     // Jcode sessions open with <system-reminder> preamble messages, so the
     // spawning directive usually sits in the second or third user message;
-    // preamble-only messages sanitize to empty and are skipped. Keep the
-    // patterns in sync with the analytics `infer_session_kind` backstop.
+    // preamble-only messages sanitize to empty and are skipped. Patterns
+    // live in `crate::types::jcode_text_is_subagent_directive`, shared with
+    // the analytics `infer_session_kind` backstop.
     if conversation_kind == "main"
         && let Some(messages) = value.get("messages").and_then(|v| v.as_array())
     {
@@ -217,17 +228,7 @@ pub(crate) fn parse_index_records(
             if sanitize_label(&first_text).is_empty() {
                 continue;
             }
-            let lower = first_text.to_lowercase();
-            if lower.contains("you are a low-effort fact-checker")
-                || lower.contains("role: manager")
-                || lower.contains("you are a subagent")
-                || lower.contains("you are downstream")
-                || lower.contains("you are the downstream")
-                || lower.contains("implementation worker")
-                || lower.contains("investigation subagent")
-                || lower.contains("0 repo writes")
-                || lower.contains("deep validation:")
-            {
+            if jcode_text_is_subagent_directive(&first_text.to_lowercase()) {
                 conversation_kind = "subagent";
             }
             break;
@@ -506,6 +507,7 @@ pub(crate) fn parse_index_records(
     }
 
     Ok(IndexParseOutput {
+        // Change marker only: resume always restarts at JCODE_PARSE_ORIGIN.
         offset: bytes_len,
         turn_id,
         pending_tool_calls,
@@ -631,7 +633,7 @@ mod tests {
                 "id": "session_test_123",
                 "parent_id": null,
                 "title": "Test Jcode Session",
-                "working_dir": "/Users/joe/Developer/memex",
+                "working_dir": "/repo/memex",
                 "provider_key": "meta-muse",
                 "model": "muse-spark-1.2-contributor",
                 "messages": [
@@ -811,6 +813,24 @@ mod tests {
         )
         .unwrap();
         assert!(records.is_empty());
+    }
+
+    #[test]
+    fn ordinary_prompts_with_worker_words_stay_main() {
+        // Adversarial negatives: each contains a bare worker-vocabulary
+        // word, but none in the role-assignment or constraint forms the
+        // classifier requires.
+        for text in [
+            "Add a `role: manager` column to the users table and backfill it.",
+            "Please review the implementation worker pool sizing in src/pool.rs",
+            "Our CI policy says 0 repo writes from forks - document that in CONTRIBUTING.md",
+        ] {
+            assert_eq!(
+                kind_for_user_texts(&[text]),
+                Some("main".to_string()),
+                "should stay main: {text}"
+            );
+        }
     }
 
     #[test]

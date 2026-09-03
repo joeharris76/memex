@@ -1,5 +1,8 @@
-use crate::state::SessionScope;
-use crate::types::{Record, SourceFilter, SourceKind};
+<use crate::state::SessionScope;
+use crate::types::{
+    Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
+    jcode_tmp_cwd_is_worker_sandbox,
+};
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, params_from_iter};
 use serde::{Deserialize, Serialize};
@@ -41,6 +44,29 @@ pub enum SessionKindFilter {
     Subagent,
     #[default]
     All,
+}
+
+impl SessionKindFilter {
+    /// Row-level predicate shared by SQL filters, the TUI, and CLI search:
+    /// interactive is (missing or 'main'); every other stored kind buckets
+    /// as subagent.
+    ///
+    /// The bucketing is intentionally lossy: the store keeps six session
+    /// kinds (`main`, `subagent`, `fork`, `sidechain`, `compaction`,
+    /// `branch`) but the query surface only switches on interactive or
+    /// not — forked, compacted, branched, and sidechain sessions are all
+    /// "not the user's own turn". Per-kind fidelity is not destroyed: it
+    /// stays on the `conversation_kind` column and on per-record links
+    /// for graph/search grouping. If this predicate ever gains a third
+    /// bucket, the `every_stored_kind_has_a_defined_filter_bucket` test
+    /// names every kind that must be reconsidered.
+    pub fn matches_kind(self, kind: Option<&str>) -> bool {
+        match self {
+            SessionKindFilter::All => true,
+            SessionKindFilter::Primary => kind.is_none() || kind == Some("main"),
+            SessionKindFilter::Subagent => kind.is_some() && kind != Some("main"),
+        }
+    }
 }
 
 /// A session row with every stored column, for `memex sessions`.
@@ -844,9 +870,13 @@ impl AnalyticsWriter {
         {
             entry.first_user_text = Some(record.text.clone());
         }
-        if entry.conversation_kind.is_none()
-            && let Some(kind) = record.links.conversation_kind.clone()
+        // Prefer an explicit "main" over per-record non-main kinds: Pi and
+        // OpenClaw stamp compaction/branch on entries inside otherwise-main
+        // sessions, and Claude stamps sidechain lines the same way. A session
+        // is non-interactive only when no record claims it as main.
+        if let Some(kind) = record.links.conversation_kind.clone()
             && !kind.is_empty()
+            && (entry.conversation_kind.is_none() || kind == "main")
         {
             entry.conversation_kind = Some(kind);
         }
@@ -885,8 +915,12 @@ impl AnalyticsWriter {
                     last_at = MAX(sessions.last_at, excluded.last_at),
                     message_count = sessions.message_count + excluded.message_count,
                     resolution_status = excluded.resolution_status,
+<                    -- The stored label/kind describe the session's opening and
+                    -- survive incremental deltas, which only see mid-session
+                    -- records. Corrections flow through parser-version bumps,
+                    -- which delete the row first (delete_first) and recompute.
                     label = COALESCE(sessions.label, excluded.label),
-                    conversation_kind = COALESCE(excluded.conversation_kind, sessions.conversation_kind)
+                    conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind)
                 "#,
             )?;
             // OpenCode title/agent lookups hit the source SQLite database. Sessions
@@ -1302,10 +1336,11 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 pub fn sanitize_label(raw: &str) -> String {
     // Comprehensive stripping of system wrappers (case-insensitive).
     // Fast path: neither the tag stripper nor the generic unwrap can match
-    // without a '<', so skip both scans for ordinary prose. This keeps the
+    // without a '<', so ordinary prose skips the owned buffer entirely and
+    // goes straight to the single-allocation finish pass. This keeps the
     // per-record emptiness check in `record` cheap during index scans.
-    let mut current = raw.to_string();
-    if current.contains('<') {
+    if raw.contains('<') {
+        let mut current = raw.to_string();
         const DROP_TAGS: &[&str] = &[
             "system-reminder",
             "command-message",
@@ -1381,32 +1416,52 @@ pub fn sanitize_label(raw: &str) -> String {
                 break;
             }
         }
+        return finish_label(&current);
     }
-    let ansi_stripped = strip_ansi(&current);
-    let collapsed = ansi_stripped
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
-    let trimmed = collapsed.trim();
-    if trimmed.is_empty() {
+    finish_label(raw)
+}
+
+/// Single-allocation finish pass for `sanitize_label`: ANSI strip (borrowed
+/// when there is no ESC), whitespace collapse, control-char removal, and
+/// the boilerplate suppressions. Equivalent to the old
+/// split-whitespace-join plus control-filter pipeline: after collapsing,
+/// the only surviving whitespace is ' ', and the suppression patterns are
+/// pure ASCII so `eq_ignore_ascii_case` matches `to_lowercase` + compare
+/// on them without a whole-message lowercase copy.
+fn finish_label(text: &str) -> String {
+    let stripped;
+    let no_ansi: &str = if text.contains('\x1b') {
+        stripped = strip_ansi(text);
+        &stripped
+    } else {
+        text
+    };
+    let mut collapsed = String::with_capacity(no_ansi.len().min(1024));
+    let mut pending_space = false;
+    for c in no_ansi.chars() {
+        if c.is_control() && c != ' ' {
+            continue;
+        }
+        if c.is_whitespace() {
+            pending_space = true;
+            continue;
+        }
+        if pending_space && !collapsed.is_empty() {
+            collapsed.push(' ');
+        }
+        pending_space = false;
+        collapsed.push(c);
+    }
+    if collapsed.is_empty() {
         return String::new();
     }
-    let lower = trimmed.to_lowercase();
-    if lower.starts_with("# agents.md")
-        || lower.contains("global agent preferences")
-        || lower.starts_with("you are a reminder observer")
+    if starts_ascii_ci(&collapsed, "# agents.md")
+        || find_ascii_ci(&collapsed, "global agent preferences").is_some()
+        || starts_ascii_ci(&collapsed, "you are a reminder observer")
     {
         return String::new();
     }
-    // Remove non-printable control chars
-    let printable: String = trimmed
-        .chars()
-        .filter(|c| !c.is_control() || *c == ' ')
-        .collect();
-    let printable = printable.trim();
-    if printable.is_empty() {
-        return String::new();
-    }
+    let printable = collapsed.as_str();
     if printable.chars().count() <= MAX_LABEL_CHARS {
         return printable.to_string();
     }
@@ -1461,6 +1516,14 @@ fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
         return None;
     }
     (0..=hay.len() - ndl.len()).find(|&i| hay[i..i + ndl.len()].eq_ignore_ascii_case(ndl))
+}
+
+/// ASCII case-insensitive prefix test. Uses `get` so a needle length that
+/// lands mid-char safely returns false instead of panicking.
+fn starts_ascii_ci(haystack: &str, needle: &str) -> bool {
+    haystack
+        .get(..needle.len())
+        .is_some_and(|head| head.eq_ignore_ascii_case(needle))
 }
 
 fn strip_ansi(input: &str) -> String {
@@ -1617,7 +1680,10 @@ fn jcode_label_from_file(path: &str) -> Option<String> {
     None
 }
 
-fn opencode_agent_is_subagent(db_path: &str, session_id: &str) -> bool {
+/// Parent linkage is the only subagent signal: the `agent` column records
+/// the selected agent (build/plan/custom), so a plan-mode session without
+/// a parent is still interactive.
+fn opencode_session_has_parent(db_path: &str, session_id: &str) -> bool {
     let path = Path::new(db_path);
     if !path.is_file() {
         return false;
@@ -1632,27 +1698,25 @@ fn opencode_agent_is_subagent(db_path: &str, session_id: &str) -> bool {
     let _ = conn.busy_timeout(Duration::from_secs(1));
     let check = || -> Option<bool> {
         let mut stmt = conn
-            .prepare("SELECT agent FROM session WHERE id = ?1")
+            .prepare("SELECT parent_id FROM session WHERE id = ?1")
             .ok()?;
-        let agent: Option<String> = stmt
+        let parent: Option<String> = stmt
             .query_row(params![session_id], |row| row.get(0))
             .optional()
             .ok()
             .flatten();
-        Some(!crate::sources::opencode::opencode_agent_is_primary(
-            agent.as_deref(),
-        ))
+<        Some(parent.is_some_and(|p| !p.trim().is_empty()))
     };
     check().unwrap_or(false)
 }
 
-/// Memoized OpenCode source-database lookups for one flush. Titles and agent
-/// names are immutable per session, so caching across the sessions of a flush
-/// only collapses repeated reads of the same row.
+/// Memoized OpenCode source-database lookups for one flush. Titles and
+/// parent links are immutable per session, so caching across the sessions
+/// of a flush only collapses repeated reads of the same row.
 #[derive(Default)]
 struct OpencodeLookupCache {
     titles: HashMap<(String, String), Option<String>>,
-    subagent: HashMap<(String, String), bool>,
+    parented: HashMap<(String, String), bool>,
 }
 
 impl OpencodeLookupCache {
@@ -1663,11 +1727,11 @@ impl OpencodeLookupCache {
             .clone()
     }
 
-    fn is_subagent(&mut self, db_path: &str, session_id: &str) -> bool {
+    fn has_parent(&mut self, db_path: &str, session_id: &str) -> bool {
         *self
-            .subagent
+            .parented
             .entry((db_path.to_string(), session_id.to_string()))
-            .or_insert_with(|| opencode_agent_is_subagent(db_path, session_id))
+            .or_insert_with(|| opencode_session_has_parent(db_path, session_id))
     }
 }
 
@@ -1728,57 +1792,45 @@ fn infer_session_kind(
     }
     match source {
         SourceKind::Jcode => {
+            // Same worker-sandbox rule as the parser: a bare /tmp cwd is
+            // not evidence, only a sandbox leaf name is.
             if let Some(cwd) = cwd
-                && (cwd.starts_with("/tmp/")
-                    || cwd.starts_with("/private/tmp/")
-                    || cwd == "/tmp"
-                    || cwd == "/private/tmp")
+                && jcode_tmp_cwd_is_worker_sandbox(cwd)
             {
                 return Some("subagent".to_string());
             }
             if let Some(text) = first_user_text {
-                // Keep in sync with the jcode parser directive scan.
-                let lower = text.to_lowercase();
-                if lower.contains("you are a low-effort fact-checker")
-                    || lower.contains("role: manager")
-                    || lower.contains("you are a subagent")
-                    || lower.contains("you are a low effort")
-                    || lower.contains("you are downstream")
-                    || lower.contains("you are the downstream")
-                    || lower.contains("implementation worker")
-                    || lower.contains("investigation subagent")
-                    || lower.contains("0 repo writes")
-                    || lower.contains("deep validation:")
-                {
+                // Shared with the jcode parser directive scan; see
+                // `crate::types::jcode_text_is_subagent_directive`.
+                if jcode_text_is_subagent_directive(&text.to_lowercase()) {
                     return Some("subagent".to_string());
                 }
             }
         }
         SourceKind::Opencode => {
-            if opencode.is_subagent(source_path, session_id) {
-                return Some("subagent".to_string());
+            // Same value the parser stores, so parse-time and backfill
+            // classification can never disagree.
+            if opencode.has_parent(source_path, session_id) {
+                return Some("fork".to_string());
             }
         }
-        SourceKind::Muse => {
-            let normalized = source_path.replace('\\', "/");
-            if normalized.contains("/subagent/") || normalized.contains("/subagents/") {
-                return Some("subagent".to_string());
-            }
-        }
-        SourceKind::Claude => {
-            let normalized = source_path.replace('\\', "/");
-            if normalized.contains("/subagents/") || normalized.contains("/subagent/") {
-                return Some("subagent".to_string());
-            }
-        }
-        SourceKind::Cursor => {
-            // Match whole path components (like the Cursor parser's
-            // `is_subagent_transcript`): a bare substring would false-positive
-            // on projects such as `my-subagents-tool`.
+        // Match whole path components (like the Cursor parser's
+        // `is_subagent_transcript`): a bare substring would false-positive
+        // on projects such as `my-subagents-tool`.
+        SourceKind::Muse | SourceKind::Claude | SourceKind::Cursor => {
             let normalized = source_path.replace('\\', "/");
             if normalized
                 .split('/')
                 .any(|c| c == "subagents" || c == "subagent")
+            {
+                return Some("subagent".to_string());
+            }
+            // Same agent-file convention as the Claude parser's
+            // `is_agent_transcript`: applies to any of these sources.
+            if source == SourceKind::Claude
+                && let Some(name) = normalized.rsplit('/').next()
+                && name.starts_with("agent-")
+                && name.ends_with(".jsonl")
             {
                 return Some("subagent".to_string());
             }
@@ -2318,35 +2370,28 @@ mod tests {
     }
 
     #[test]
-    fn analytics_preserves_label_on_incremental_append() {
+    fn incremental_delta_keeps_original_label_and_kind() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let transcript = tmp.path().join("session.jsonl");
-        fs::write(
-            &transcript,
-            format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
-                tmp.path().display()
-            ),
-        )
-        .expect("write");
+        fs::write(&transcript, "").expect("write");
         let db = tmp.path().join("analytics.sqlite");
-        let mut writer = AnalyticsWriter::open(&db).expect("open");
-        let mut first = record("proj", "s-append", &transcript, 10);
+        let mut first = record("proj", "s-delta", &transcript, 10);
         first.role = "user".to_string();
-        first.text = "Fix the login bug on the dashboard".to_string();
+        first.text = "REAL FIRST PROMPT about the login bug".to_string();
         first.links.conversation_kind = Some("main".to_string());
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
         writer.record(&first).expect("record");
         writer.flush().expect("flush");
-
-        // An append-only batch resumes past the original prompt, so its
-        // derived label reflects a later turn and must not replace the stored one.
-        let mut later = record("proj", "s-append", &transcript, 20);
-        later.role = "user".to_string();
-        later.text = "Also check the settings page".to_string();
-        later.links.conversation_kind = Some("main".to_string());
-        writer.record(&later).expect("record");
+        drop(writer);
+        // A later incremental run sees only a mid-session message, possibly
+        // with a different per-record kind. Neither may clobber the stored row.
+        let mut delta = record("proj", "s-delta", &transcript, 20);
+        delta.role = "user".to_string();
+        delta.text = "now also update the changelog".to_string();
+        delta.links.conversation_kind = Some("subagent".to_string());
+        let mut writer = AnalyticsWriter::open(&db).expect("reopen");
+        writer.record(&delta).expect("record");
         writer.flush().expect("flush");
-
         let store = AnalyticsStore::open_read_only(&db).expect("open ro");
         let rows = store
             .query_sessions_detailed(None, None, None, None, None)
@@ -2354,8 +2399,101 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0].label.as_deref(),
-            Some("Fix the login bug on the dashboard")
+            Some("REAL FIRST PROMPT about the login bug")
         );
+        assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn main_record_wins_over_compaction_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "").expect("write");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        // Compaction summary arrives before any main message, as in a
+        // resumed Pi transcript: the session is still interactive.
+        let mut summary = record("proj", "s-compact", &transcript, 5);
+        summary.role = "user".to_string();
+        summary.text = "summary of prior work".to_string();
+        summary.links.conversation_kind = Some("compaction".to_string());
+        writer.record(&summary).expect("record");
+        let mut prompt = record("proj", "s-compact", &transcript, 10);
+        prompt.role = "user".to_string();
+        prompt.text = "please fix the parser".to_string();
+        prompt.links.conversation_kind = Some("main".to_string());
+        writer.record(&prompt).expect("record");
+        writer.flush().expect("flush");
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let rows = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn every_stored_kind_has_a_defined_filter_bucket() {
+        // Contract: Primary is (NULL or 'main'); every other stored kind
+        // filters as subagent. If the predicate ever changes, this test
+        // names every kind that must be reconsidered.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        for (id, kind, ts) in [
+            ("s-main", "main", 10),
+            ("s-sub", "subagent", 20),
+            ("s-fork", "fork", 30),
+            ("s-side", "sidechain", 40),
+            ("s-compact", "compaction", 50),
+            ("s-branch", "branch", 60),
+        ] {
+            let path = tmp.path().join(format!("{id}.jsonl"));
+            fs::write(&path, "").expect("write");
+            let mut rec = record("proj", id, &path, ts);
+            rec.role = "user".to_string();
+            rec.text = format!("task {id}");
+            rec.links.conversation_kind = Some(kind.to_string());
+            writer.record(&rec).expect("record");
+        }
+        writer.flush().expect("flush");
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let filtered = |kind| {
+            store
+                .query_sessions_detailed_filtered(None, None, None, None, Some(kind), None)
+                .expect("query")
+                .into_iter()
+                .map(|row| row.session_id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(filtered(SessionKindFilter::Primary), vec!["s-main"]);
+        let mut sub = filtered(SessionKindFilter::Subagent);
+        sub.sort();
+        assert_eq!(
+            sub,
+            vec!["s-branch", "s-compact", "s-fork", "s-side", "s-sub"]
+        );
+        assert_eq!(
+            store
+                .query_sessions_detailed(None, None, None, None, None)
+                .expect("all")
+                .len(),
+            6
+        );
+    }
+
+    #[test]
+    fn session_cwd_resolves_from_jcode_working_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("session_cwd.json");
+        fs::write(
+            &path,
+            r#"{"id":"s-cwd","working_dir":"/repo/example","messages":[]}"#,
+        )
+        .expect("write");
+        let cwd =
+            resolve_session_cwd_from_parts(SourceKind::Jcode, &path.to_string_lossy(), "s-cwd");
+        assert_eq!(cwd.as_deref(), Some("/repo/example"));
     }
 
     #[test]
@@ -2447,27 +2585,36 @@ mod tests {
     }
 
     #[test]
-    fn jcode_tmp_cwd_is_classified_as_subagent() {
+    fn jcode_tmp_cwd_needs_worker_sandbox_leaf_for_subagent() {
         let _tmp = tempfile::tempdir().expect("tempdir");
         let _transcript = _tmp.path().join("session_session_tmp.json");
         // Need a file that contains cwd; but we also need to test inference via cwd.
         // We'll directly test infer_session_kind helper.
-        let kind = infer_session_kind(
-            SourceKind::Jcode,
-            "/tmp/.jcode/sessions/session_tmp.json",
-            "session_tmp",
-            Some("main"),
-            Some("/tmp/work"),
-            Some("hello"),
-            &mut OpencodeLookupCache::default(),
+        let infer = |cwd: &str| {
+            infer_session_kind(
+                SourceKind::Jcode,
+                "/tmp/.jcode/sessions/session_tmp.json",
+                "session_tmp",
+                None,
+                Some(cwd),
+                Some("hello"),
+                &mut OpencodeLookupCache::default(),
+            )
+        };
+        // A bare /tmp cwd is not evidence: users legitimately work in /tmp.
+        assert_eq!(infer("/tmp/work").as_deref(), Some("main"));
+        assert_eq!(infer("/tmp").as_deref(), Some("main"));
+        // A worker-sandbox leaf under /tmp corroborates a spawned worker.
+        assert_eq!(
+            infer("/private/tmp/bossmode-hygiene-v2-worker-docs").as_deref(),
+            Some("subagent")
         );
-        assert_eq!(kind.as_deref(), Some("subagent"));
         let kind2 = infer_session_kind(
             SourceKind::Jcode,
             "/tmp/.jcode/sessions/session_main.json",
             "session_main",
             Some("main"),
-            Some("/Users/joe/Code/memex"),
+            Some("/repo/example"),
             Some("hello"),
             &mut OpencodeLookupCache::default(),
         );

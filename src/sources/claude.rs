@@ -93,6 +93,10 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
         if under_subagents && (!include_agents || !is_agent) {
             continue;
         }
+        // Standard sessions live at most two levels below root
+        // (`<project>/<session>.jsonl`); only agent transcripts nest
+        // deeper, under a `subagents/` directory (see `is_subagent_path`).
+        // Anything deeper outside `subagents/` is not a session file.
         let relative_depth = entry
             .path()
             .strip_prefix(root)

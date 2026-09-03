@@ -184,7 +184,12 @@ pub(crate) fn parse_index_records(
 
     let source_path = path.to_string_lossy().to_string();
     let normalized_path = source_path.replace('\\', "/");
-    let is_subagent = normalized_path.contains("/subagent/");
+    // Muse writes worker transcripts under `<session>/subagent*/…` (plural is
+    // also seen); match on path components, not substrings, so a session id
+    // that merely contains the word never misfires.
+    let is_subagent = Path::new(&normalized_path)
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with("subagent"));
 
     let mut session_id = session_id_from_path(path);
     let mut parent_session_id = None;
@@ -638,11 +643,11 @@ mod tests {
         std::fs::write(
             &path,
             concat!(
-                r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308372342264,"payload":{"kind":"metadata","record":{"workspace_root":"/Users/joe/Developer/memex","provider_id":"meta","model_id":"muse-spark-1.2"}}}"#, "\n",
+                r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308372342264,"payload":{"kind":"metadata","record":{"workspace_root":"/repo/memex","provider_id":"meta","model_id":"muse-spark-1.2"}}}"#, "\n",
                 r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308372900000,"payload":{"kind":"run","event":{"kind":"started","prompt":"Hello Muse"}}}"#, "\n",
                 r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373000000,"payload":{"kind":"run","event":{"kind":"reasoning_committed","message_id":"m1","text":"Let me think"}}}"#, "\n",
                 r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373100000,"payload":{"kind":"run","event":{"kind":"assistant_tool_calls_committed","message_id":"m1","tool_calls":[{"call_id":"call1","name":"bash","args":"{\"command\":\"pwd\"}"}]}}}"#, "\n",
-                r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373200000,"payload":{"kind":"run","event":{"kind":"tool_result_batch_committed","results":[{"tool_call_id":"call1","text":"/Users/joe/Developer/memex"}]}}}"#, "\n",
+                r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373200000,"payload":{"kind":"run","event":{"kind":"tool_result_batch_committed","results":[{"tool_call_id":"call1","text":"/repo/memex"}]}}}"#, "\n",
                 r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373300000,"payload":{"kind":"run","event":{"kind":"model_completed","model":"muse-spark-1.2","usage":{"input_tokens":100,"output_tokens":20,"cached_tokens":10,"reasoning_tokens":5}}}}"#, "\n",
                 r#"{"stream":{"kind":"session","id":"01a05f7c-3b49-77a1"},"recorded_at":1788308373400000,"payload":{"kind":"run","event":{"kind":"assistant_message_committed","message_id":"m2","text":"I checked the current directory."}}}"#, "\n"
             ),

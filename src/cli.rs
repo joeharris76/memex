@@ -246,6 +246,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Filter by session origin: interactive, subagent, or all
+        #[arg(long, value_enum, default_value_t = SessionOrigin::All)]
+        origin: SessionOrigin,
         /// Use semantic (embedding-based) search instead of keyword search
         #[arg(long)]
         semantic: bool,
@@ -896,6 +899,7 @@ pub fn run() -> Result<()> {
             tool,
             session,
             source,
+            origin,
             semantic,
             hybrid,
             min_score,
@@ -923,6 +927,7 @@ pub fn run() -> Result<()> {
                 tool,
                 session,
                 source,
+                origin,
                 semantic,
                 hybrid,
                 min_score,
@@ -1487,6 +1492,7 @@ fn run_search(
     tool: Option<String>,
     session: Option<String>,
     source: Option<SourceFilter>,
+    origin: SessionOrigin,
     semantic: bool,
     hybrid: bool,
     min_score: Option<f32>,
@@ -1540,6 +1546,7 @@ fn run_search(
     } else {
         top_n_per_session
     };
+    let kind_filter: crate::analytics::SessionKindFilter = origin.into();
     let render = RenderOptions {
         verbose,
         matchers,
@@ -1549,12 +1556,14 @@ fn run_search(
         min_score,
         top_n_per_session,
         limit,
+        kind_filter,
     };
 
     let candidate_limit = if queries.len() > 1
         || top_n_per_session.is_some()
         || options.source.is_some()
         || cwd.is_some()
+        || kind_filter != crate::analytics::SessionKindFilter::All
     {
         (limit * 5).max(limit + 10)
     } else {
@@ -1646,6 +1655,7 @@ struct RenderOptions {
     min_score: Option<f32>,
     top_n_per_session: Option<usize>,
     limit: usize,
+    kind_filter: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Serialize)]
@@ -2814,15 +2824,30 @@ fn run_herdr_resume(
 
     let mut rows =
         store.query_sessions_detailed(source, None, cwd_filter.as_deref(), None, None)?;
+    // Resume-last targets the user's own work, never a background worker
+    // transcript. An explicit session id still resumes anything.
+    let interactive = |row: &crate::analytics::SessionDetailRow| {
+        row.conversation_kind
+            .as_deref()
+            .is_none_or(|kind| kind == "main")
+    };
     if let Some(session_id) = &session_id {
         rows.retain(|row| &row.session_id == session_id);
         if rows.is_empty() {
             return Err(anyhow!("session '{session_id}' not found"));
         }
-    } else if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-        // The public CLI keeps its historical global fallback unless the Herdr plugin
-        // explicitly requires the focused directory to match.
-        rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+    } else {
+        if rows.iter().any(&interactive) {
+            rows.retain(&interactive);
+        }
+        if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
+            // The public CLI keeps its historical global fallback unless the Herdr plugin
+            // explicitly requires the focused directory to match.
+            rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+            if rows.iter().any(&interactive) {
+                rows.retain(&interactive);
+            }
+        }
     }
 
     let Some((row, command, cwd)) = rows
@@ -4539,6 +4564,39 @@ fn apply_post_processing_located(
 ) -> Vec<LocatedRecord> {
     if let Some(min_score) = render.min_score {
         results.retain(|result| result.score >= min_score);
+    }
+
+    // Session-grouped origin filter with prefer-main: a sidechain hit inside
+    // a primary session must not hide the session (mirrors the TUI and the
+    // analytics accumulator).
+    if render.kind_filter != crate::analytics::SessionKindFilter::All {
+        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
+        for result in &results {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            let dominated = result.record.links.conversation_kind.as_deref() == Some("main");
+            group_kind
+                .entry(key)
+                .and_modify(|kind| {
+                    if dominated {
+                        *kind = Some("main".to_string());
+                    }
+                })
+                .or_insert_with(|| result.record.links.conversation_kind.clone());
+        }
+        results.retain(|result| {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            render
+                .kind_filter
+                .matches_kind(group_kind.get(&key).and_then(|kind| kind.as_deref()))
+        });
     }
 
     match render.sort {
