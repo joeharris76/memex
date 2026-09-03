@@ -454,10 +454,10 @@ EXAMPLES:
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Filter by session origin: interactive, subagent, or all
-        #[arg(long, value_enum, default_value_t = SessionKind::All)]
-        kind: SessionKind,
-        /// Only show interactive sessions (alias for --kind interactive)
-        #[arg(long, conflicts_with = "kind")]
+        #[arg(long, value_enum, default_value_t = SessionOrigin::All)]
+        origin: SessionOrigin,
+        /// Only show interactive sessions (alias for --origin interactive)
+        #[arg(long, conflicts_with = "origin")]
         primary_only: bool,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
@@ -711,18 +711,18 @@ impl From<TransferMode> for CoreTransferMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-enum SessionKind {
+enum SessionOrigin {
     Interactive,
     Subagent,
     All,
 }
 
-impl From<SessionKind> for crate::analytics::SessionKindFilter {
-    fn from(value: SessionKind) -> Self {
+impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
+    fn from(value: SessionOrigin) -> Self {
         match value {
-            SessionKind::Interactive => crate::analytics::SessionKindFilter::Primary,
-            SessionKind::Subagent => crate::analytics::SessionKindFilter::Subagent,
-            SessionKind::All => crate::analytics::SessionKindFilter::All,
+            SessionOrigin::Interactive => crate::analytics::SessionKindFilter::Primary,
+            SessionOrigin::Subagent => crate::analytics::SessionKindFilter::Subagent,
+            SessionOrigin::All => crate::analytics::SessionKindFilter::All,
         }
     }
 }
@@ -1093,17 +1093,17 @@ pub fn run() -> Result<()> {
             source,
             since,
             limit,
-            kind,
+            origin,
             primary_only,
             json_array,
             root,
         } => {
-            let kind = if primary_only {
-                SessionKind::Interactive
+            let origin = if primary_only {
+                SessionOrigin::Interactive
             } else {
-                kind
+                origin
             };
-            run_sessions(cwd, project, source, since, limit, kind, json_array, root)?;
+            run_sessions(cwd, project, source, since, limit, origin, json_array, root)?;
         }
         Commands::Herdr { action } => match action {
             HerdrCommand::ResumeLast {
@@ -2749,7 +2749,7 @@ fn run_sessions(
     source: Option<SourceFilter>,
     since: Option<String>,
     limit: usize,
-    kind: SessionKind,
+    origin: SessionOrigin,
     json_array: bool,
     root: Option<PathBuf>,
 ) -> Result<()> {
@@ -2758,8 +2758,8 @@ fn run_sessions(
     let store = open_analytics_read_only(&paths)?;
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
-    let kind_filter = match kind {
-        SessionKind::All => None,
+    let kind_filter = match origin {
+        SessionOrigin::All => None,
         other => Some(other.into()),
     };
     let rows = store.query_sessions_detailed_filtered(
@@ -4892,13 +4892,19 @@ mod tests {
 
     #[test]
     #[test]
-    fn sessions_primary_only_conflicts_with_explicit_kind() {
+    fn sessions_primary_only_conflicts_with_explicit_origin() {
         assert!(
-            Cli::try_parse_from(["memex", "sessions", "--kind", "subagent", "--primary-only"])
-                .is_err()
+            Cli::try_parse_from([
+                "memex",
+                "sessions",
+                "--origin",
+                "subagent",
+                "--primary-only"
+            ])
+            .is_err()
         );
         assert!(Cli::try_parse_from(["memex", "sessions", "--primary-only"]).is_ok());
-        assert!(Cli::try_parse_from(["memex", "sessions", "--kind", "subagent"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--origin", "subagent"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
     }
 
