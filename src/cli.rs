@@ -458,7 +458,7 @@ EXAMPLES:
         origin: SessionOrigin,
         /// Only show interactive sessions (alias for --origin interactive)
         #[arg(long, conflicts_with = "origin")]
-        primary_only: bool,
+        interactive_only: bool,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
         json_array: bool,
@@ -1094,11 +1094,11 @@ pub fn run() -> Result<()> {
             since,
             limit,
             origin,
-            primary_only,
+            interactive_only,
             json_array,
             root,
         } => {
-            let origin = if primary_only {
+            let origin = if interactive_only {
                 SessionOrigin::Interactive
             } else {
                 origin
@@ -4891,19 +4891,18 @@ mod tests {
     use tempfile::TempDir;
 
     #[test]
-    #[test]
-    fn sessions_primary_only_conflicts_with_explicit_origin() {
+    fn sessions_interactive_only_conflicts_with_explicit_origin() {
         assert!(
             Cli::try_parse_from([
                 "memex",
                 "sessions",
                 "--origin",
                 "subagent",
-                "--primary-only"
+                "--interactive-only"
             ])
             .is_err()
         );
-        assert!(Cli::try_parse_from(["memex", "sessions", "--primary-only"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--interactive-only"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions", "--origin", "subagent"]).is_ok());
         assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
     }
