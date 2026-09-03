@@ -15,10 +15,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    // Bumped for preamble-record exclusion: forces a full re-parse so
-    // stale preamble records are purged and preamble-only sessions drop
-    // out on next index.
-    index: 4,
+    // Bumped for the worker-sandbox cwd rule: forces a full re-parse so
+    // bare-/tmp-cwd sessions reclassify on next index.
+    index: 5,
     usage: 1,
 };
 

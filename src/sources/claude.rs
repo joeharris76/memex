@@ -18,7 +18,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    // Bumped for the agent-file backfill mirror: forces a full re-parse
+    // so unlabeled agent-*.jsonl transcripts reclassify on next index.
+    index: 4,
     usage: 4,
 };
 

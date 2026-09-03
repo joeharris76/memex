@@ -14,7 +14,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 1,
+    // Bumped for subagent* directory matching: forces a full re-parse so
+    // plural-dir worker transcripts reclassify on next index.
+    index: 2,
     usage: 1,
 };
 
