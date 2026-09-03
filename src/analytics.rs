@@ -1737,11 +1737,16 @@ fn infer_session_kind(
                 return Some("subagent".to_string());
             }
             if let Some(text) = first_user_text {
+                // Keep in sync with the jcode parser directive scan.
                 let lower = text.to_lowercase();
                 if lower.contains("you are a low-effort fact-checker")
                     || lower.contains("role: manager")
                     || lower.contains("you are a subagent")
                     || lower.contains("you are a low effort")
+                    || lower.contains("you are downstream")
+                    || lower.contains("you are the downstream")
+                    || lower.contains("implementation worker")
+                    || lower.contains("investigation subagent")
                 {
                     return Some("subagent".to_string());
                 }

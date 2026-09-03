@@ -1,4 +1,5 @@
 use super::{IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions, SourceFile};
+use crate::analytics::sanitize_label;
 use crate::types::{Record, RecordLinks, SourceKind};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
@@ -178,11 +179,15 @@ pub(crate) fn parse_index_records(
     } else {
         "main"
     };
-    // Check directives in first user message for subagent hints
+    // Check directives in the first real user message for subagent hints.
+    // Jcode sessions open with <system-reminder> preamble messages, so the
+    // spawning directive usually sits in the second or third user message;
+    // preamble-only messages sanitize to empty and are skipped. Keep the
+    // patterns in sync with the analytics `infer_session_kind` backstop.
     if conversation_kind == "main"
         && let Some(messages) = value.get("messages").and_then(|v| v.as_array())
     {
-        for message in messages.iter().take(3) {
+        for message in messages {
             let Some(obj) = message.as_object() else {
                 continue;
             };
@@ -206,13 +211,19 @@ pub(crate) fn parse_index_records(
                     }
                 }
             }
+            if sanitize_label(&first_text).is_empty() {
+                continue;
+            }
             let lower = first_text.to_lowercase();
             if lower.contains("you are a low-effort fact-checker")
                 || lower.contains("role: manager")
                 || lower.contains("you are a subagent")
+                || lower.contains("you are downstream")
+                || lower.contains("you are the downstream")
+                || lower.contains("implementation worker")
+                || lower.contains("investigation subagent")
             {
                 conversation_kind = "subagent";
-                break;
             }
             break;
         }
@@ -689,5 +700,78 @@ mod tests {
             Some("muse-spark-1.2-contributor")
         );
         assert_eq!(events[0].provider.as_deref(), Some("meta-muse"));
+    }
+
+    fn kind_for_user_texts(texts: &[&str]) -> Option<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_probe.json");
+        let messages: Vec<serde_json::Value> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                serde_json::json!({
+                    "id": format!("m{i:03}"),
+                    "role": "user",
+                    "timestamp": i as u64,
+                    "content": text,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "id": "session_probe",
+            "parent_id": null,
+            "working_dir": "/Users/joe/Developer/BenchBox",
+            "messages": messages,
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let mut kinds = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                kinds.push(rec.links.conversation_kind.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        kinds.into_iter().next().flatten()
+    }
+
+    #[test]
+    fn directive_behind_preamble_is_classified_as_subagent() {
+        let kind = kind_for_user_texts(&[
+            "<system-reminder>\n# Session Context\nDate: 2026-09-01\n</system-reminder>",
+            "You are downstream A8-A11 complete workflow mapper for BenchBox (fresh 01:48Z run). Read-only, no repo writes outside /tmp.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn worker_role_directives_are_classified_as_subagent() {
+        let kind = kind_for_user_texts(&[
+            "You are the focused implementation worker for Bossmode task task_f852ab12.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+        let kind = kind_for_user_texts(&[
+            "You are an investigation subagent. In /Users/joe/Developer/BenchBox, triage the failure.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn interactive_prompts_stay_main() {
+        // Handoff continuations and read-only reviews are routinely issued
+        // interactively; they must not match the worker-role patterns.
+        let kind = kind_for_user_texts(&[
+            "take over and fully complete all work from the interrupted session `muse resume abc123`",
+        ]);
+        assert_eq!(kind.as_deref(), Some("main"));
+        let kind = kind_for_user_texts(&[
+            "Perform a final independent read-only pre-publication review of release 0.4.0.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("main"));
     }
 }
