@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
@@ -237,8 +237,8 @@ impl AnalyticsStore {
                  label LIKE 'You are a reminder observer%'",
                 [],
             );
-            if previous_schema_version.unwrap_or(0) < 7 {
-                let _ = self.migrate_v7_repo_projects();
+            if previous_schema_version.unwrap_or(0) < 8 {
+                let _ = self.migrate_v8_repo_projects();
             }
         }
         self.conn.execute(
@@ -249,7 +249,7 @@ impl AnalyticsStore {
         Ok(())
     }
 
-    fn migrate_v7_repo_projects(&self) -> Result<()> {
+    fn migrate_v8_repo_projects(&self) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT source, session_id, source_path, project, cwd FROM sessions
              WHERE repo_project IS NULL OR repo_project = '' OR repo_project = '.codex'",
@@ -4114,7 +4114,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_7_migration_recomputes_repo_project() {
+    fn schema_8_migration_recomputes_repo_project() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("analytics.sqlite");
         let dev_dir = tmp.path().join("Developer");
@@ -4158,7 +4158,7 @@ mod tests {
             .expect("insert session");
         }
 
-        // Opening store triggers upgrade to schema 7 and runs migrate_v7_repo_projects
+        // Opening store triggers upgrade to schema 8 and runs migrate_v8_repo_projects
         let store = AnalyticsStore::open(&db_path).expect("open and migrate");
         let repo_proj: Option<String> = store
             .conn
