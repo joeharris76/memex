@@ -2791,6 +2791,7 @@ mod tests {
         let options = QueryOptions {
             query: "needle".to_string(),
             project: Some("memex".to_string()),
+            projects: None,
             role: None,
             tool: None,
             session_id: None,
@@ -3117,6 +3118,57 @@ mod tests {
             })
             .expect("search");
         assert_eq!(matched.len(), 0);
+    }
+
+    #[test]
+    fn search_filters_by_role() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut user_rec = test_record(1, "hello world");
+        user_rec.role = "user".to_string();
+        let mut assistant_rec = test_record(2, "hello back");
+        assistant_rec.role = "assistant".to_string();
+
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &user_rec).expect("user");
+        index
+            .add_record(&mut writer, &assistant_rec)
+            .expect("assistant");
+        writer.commit().expect("commit");
+
+        let user_results = index
+            .search(&QueryOptions {
+                query: "hello".to_string(),
+                role: Some("user".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search user");
+        assert_eq!(user_results.len(), 1);
+        assert_eq!(user_results[0].1.doc_id, 1);
+        assert_eq!(user_results[0].1.role, "user");
+
+        let assistant_results = index
+            .search(&QueryOptions {
+                query: "hello".to_string(),
+                role: Some("assistant".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search assistant");
+        assert_eq!(assistant_results.len(), 1);
+        assert_eq!(assistant_results[0].1.doc_id, 2);
+        assert_eq!(assistant_results[0].1.role, "assistant");
+
+        let nonexistent_results = index
+            .search(&QueryOptions {
+                query: "hello".to_string(),
+                role: Some("nonexistent".to_string()),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search nonexistent");
+        assert_eq!(nonexistent_results.len(), 0);
     }
 
     #[test]

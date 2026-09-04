@@ -764,4 +764,49 @@ mod tests {
         assert_eq!(resumed[0].session_id, "sess-1");
         assert_eq!(resumed_out.turn_id, out.turn_id + 1);
     }
+
+    #[test]
+    fn subagent_path_detects_subagent_kind_and_parent_session() {
+        let temp = tempfile::tempdir().unwrap();
+        let sub_path = temp
+            .path()
+            .join("22fe4437-parent")
+            .join("subagent")
+            .join("4fab55da-child")
+            .join("session.jsonl");
+        std::fs::create_dir_all(sub_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &sub_path,
+            concat!(
+                r#"{"stream":{"kind":"session","id":"4fab55da-child"},"recorded_at":1788308372342264,"payload":{"kind":"metadata","record":{"workspace_root":"/repo/memex","provider_id":"meta","model_id":"muse-spark-1.2"}}}"#, "\n",
+                r#"{"stream":{"kind":"session","id":"4fab55da-child"},"recorded_at":1788308372900000,"payload":{"kind":"run","event":{"kind":"started","prompt":"Subagent task"}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let mut records = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        let out = parse_index_records(
+            &sub_path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                records.push(rec);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(out.session_id.as_deref(), Some("4fab55da-child"));
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent")
+        );
+        assert_eq!(
+            records[0].links.parent_session_id.as_deref(),
+            Some("22fe4437-parent")
+        );
+        assert_eq!(records[0].links.thread_source.as_deref(), Some("subagent"));
+    }
 }

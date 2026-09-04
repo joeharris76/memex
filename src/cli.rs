@@ -9533,4 +9533,147 @@ arguments = {
         let error = parse_systemd_unit_state("memex-index.service", &unavailable).unwrap_err();
         assert!(error.to_string().contains("Failed to connect to bus"));
     }
+
+    #[test]
+    fn apply_post_processing_filters_by_kind_with_prefer_main() {
+        use crate::types::{Record, RecordLinks, SourceKind};
+
+        fn make_located(session_id: &str, kind: Option<&str>, doc_id: u64) -> LocatedRecord {
+            let mut links = RecordLinks::default();
+            links.conversation_kind = kind.map(|s| s.to_string());
+            LocatedRecord {
+                machine: "local".to_string(),
+                score: 1.0,
+                record: Record {
+                    source: SourceKind::Codex,
+                    doc_id,
+                    ts: 1000 + doc_id,
+                    project: "memex".to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: doc_id as u32,
+                    role: "user".to_string(),
+                    text: "msg".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links,
+                    source_path: "session.jsonl".to_string(),
+                },
+            }
+        }
+
+        // Session 1: mixed records, sidechain arrives first, then main
+        let s1_side = make_located("s1", Some("sidechain"), 1);
+        let s1_main = make_located("s1", Some("main"), 2);
+        // Session 2: pure subagent
+        let s2_sub = make_located("s2", Some("subagent"), 3);
+
+        let make_render = |kind_filter| RenderOptions {
+            verbose: false,
+            pretty: false,
+            matchers: Vec::new(),
+            format: SearchFormat::Jsonl,
+            fields: None,
+            sort: SortBy::Score,
+            min_score: None,
+            top_n_per_session: None,
+            limit: 10,
+            kind_filter,
+        };
+
+        let input = vec![s1_side.clone(), s1_main.clone(), s2_sub.clone()];
+        let stored_kinds = HashMap::new();
+
+        // Filter Primary: s1 is retained in full because main dominates; s2 is excluded
+        let primary_results = apply_post_processing_located(
+            input.clone(),
+            &make_render(crate::analytics::SessionKindFilter::Primary),
+            &stored_kinds,
+        );
+        let doc_ids: Vec<u64> = primary_results.iter().map(|r| r.record.doc_id).collect();
+        assert_eq!(doc_ids, vec![1, 2]);
+
+        // Filter Subagent: s1 is excluded because it's dominated by main; s2 is retained
+        let subagent_results = apply_post_processing_located(
+            input.clone(),
+            &make_render(crate::analytics::SessionKindFilter::Subagent),
+            &stored_kinds,
+        );
+        let doc_ids: Vec<u64> = subagent_results.iter().map(|r| r.record.doc_id).collect();
+        assert_eq!(doc_ids, vec![3]);
+
+        // Filter All: all records are retained
+        let all_results = apply_post_processing_located(
+            input,
+            &make_render(crate::analytics::SessionKindFilter::All),
+            &stored_kinds,
+        );
+        let doc_ids: Vec<u64> = all_results.iter().map(|r| r.record.doc_id).collect();
+        assert_eq!(doc_ids, vec![1, 2, 3]);
+    }
+
+    #[test]
+    fn cli_parses_role_and_grouping_flags() {
+        // TUI parses --role and --project
+        let cli = Cli::try_parse_from(["memex", "tui", "--role", "user", "--project", "memex"])
+            .expect("parse tui");
+        match cli.command {
+            Some(Commands::Tui { role, project, .. }) => {
+                assert_eq!(role.as_deref(), Some("user"));
+                assert_eq!(project.as_deref(), Some("memex"));
+            }
+            _ => panic!("expected Commands::Tui"),
+        }
+
+        // Search parses --role, --origin, and query
+        let cli = Cli::try_parse_from([
+            "memex",
+            "search",
+            "test query",
+            "--role",
+            "assistant",
+            "--origin",
+            "interactive",
+        ])
+        .expect("parse search");
+        match cli.command {
+            Some(Commands::Search { role, origin, .. }) => {
+                assert_eq!(role.as_deref(), Some("assistant"));
+                assert_eq!(origin, SessionOrigin::Interactive);
+            }
+            _ => panic!("expected Commands::Search"),
+        }
+
+        // Sessions parses --interactive-only
+        let cli = Cli::try_parse_from(["memex", "sessions", "--interactive-only"])
+            .expect("parse sessions interactive-only");
+        match cli.command {
+            Some(Commands::Sessions {
+                interactive_only, ..
+            }) => {
+                assert!(interactive_only);
+            }
+            _ => panic!("expected Commands::Sessions"),
+        }
+
+        // Sessions parses --origin and --project
+        let cli = Cli::try_parse_from([
+            "memex",
+            "sessions",
+            "--origin",
+            "subagent",
+            "--project",
+            "repo-xyz",
+        ])
+        .expect("parse sessions");
+        match cli.command {
+            Some(Commands::Sessions {
+                origin, project, ..
+            }) => {
+                assert_eq!(origin, SessionOrigin::Subagent);
+                assert_eq!(project.as_deref(), Some("repo-xyz"));
+            }
+            _ => panic!("expected Commands::Sessions"),
+        }
+    }
 }

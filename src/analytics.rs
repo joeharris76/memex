@@ -1585,12 +1585,23 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
         }
         if let Some(comp) = temp_component {
             let mut prefixes = Vec::new();
+            for delimiter in [
+                "-worker", ".worker", "-sandbox", ".sandbox", "-wt-", ".wt-", "-task-", ".task-",
+            ] {
+                if let Some((p, _)) = comp.split_once(delimiter) {
+                    prefixes.push(p);
+                }
+            }
+            if let Some((p, _)) = comp.rsplit_once('-') {
+                prefixes.push(p);
+            }
             if let Some((p, _)) = comp.split_once('.') {
                 prefixes.push(p);
             }
             if let Some((p, _)) = comp.split_once('-') {
                 prefixes.push(p);
             }
+            prefixes.push(&comp);
             let dev_roots = get_development_roots();
             for prefix in prefixes {
                 if prefix.is_empty() {
@@ -4152,6 +4163,56 @@ mod tests {
 
         let cwd = claude_cwd_from_source_path(session_file.to_str().expect("utf8"));
         assert_eq!(cwd.as_deref(), Some("/Users/joe/Developer/BenchBox"));
+
+        let tmp_session = claude_projects
+            .join("-tmp-sandbox-repo")
+            .join("sess-2.jsonl");
+        let cwd = claude_cwd_from_source_path(tmp_session.to_str().expect("utf8"));
+        assert_eq!(cwd.as_deref(), Some("/tmp/sandbox-repo"));
+
+        let priv_session = claude_projects
+            .join("-private-tmp-worker-test")
+            .join("sess-3.jsonl");
+        let cwd = claude_cwd_from_source_path(priv_session.to_str().expect("utf8"));
+        assert_eq!(cwd.as_deref(), Some("/private/tmp/worker-test"));
+    }
+
+    #[test]
+    fn worktree_repo_info_resolves_tmp_worker_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dev_dir = tmp.path().join("Developer");
+        let repo = dev_dir.join("my-service");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir repo .git");
+        let _guard = crate::test_support::EnvVarGuard::set(&[(
+            "HOME",
+            Some(tmp.path().to_str().expect("utf8")),
+        )]);
+
+        let worker_dir = Path::new("/tmp/my-service-worker-task-123/sub");
+        let info = worktree_repo_project(worker_dir.to_str().expect("utf8"));
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().repo_project, "my-service");
+
+        let dot_worker = Path::new("/private/tmp/my-service.worker-456");
+        let info = worktree_repo_project(dot_worker.to_str().expect("utf8"));
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().repo_project, "my-service");
+    }
+
+    #[test]
+    fn sanitize_label_handles_unclosed_tags_safely() {
+        assert_eq!(
+            sanitize_label("Valid prompt <system-reminder unclosed"),
+            "Valid prompt"
+        );
+        assert_eq!(
+            sanitize_label("Valid prompt <system-reminder>never closed content"),
+            "Valid prompt"
+        );
+        assert_eq!(
+            sanitize_label("Valid prompt <command-name>echo hi</command-name> trailing"),
+            "Valid prompt trailing"
+        );
     }
 
     #[test]
@@ -4197,6 +4258,18 @@ mod tests {
                 params![wt_path.to_str().expect("utf8")],
             )
             .expect("insert session");
+
+            let claude_source = dev_dir
+                .join(".claude")
+                .join("projects")
+                .join("-Users-joe-Developer-memex")
+                .join("session.jsonl");
+            conn.execute(
+                "INSERT INTO sessions (source, session_id, source_path, project, cwd, started_at, last_at)
+                 VALUES ('claude', 's-claude1', ?1, '-Users-joe-Developer-memex', NULL, 1000, 2000)",
+                params![claude_source.to_str().expect("utf8")],
+            )
+            .expect("insert claude session");
         }
 
         // Opening store triggers upgrade to schema 9 and runs migrate_v9_repo_projects
@@ -4210,5 +4283,15 @@ mod tests {
             )
             .expect("query migrated repo_project");
         assert_eq!(repo_proj.as_deref(), Some("MyCoolRepo"));
+
+        let claude_proj: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT repo_project FROM sessions WHERE session_id = 's-claude1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migrated claude repo_project");
+        assert_eq!(claude_proj.as_deref(), Some("memex"));
     }
 }

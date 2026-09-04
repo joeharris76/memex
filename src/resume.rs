@@ -166,4 +166,16 @@ mod tests {
             Some("opencode --session {session_id}")
         );
     }
+
+    #[test]
+    fn remote_jcode_and_muse_default_resume_templates() {
+        assert_eq!(
+            default_resume_template("jcode", true).as_deref(),
+            Some("cd {cwd_shell} && jcode --resume {session_id}")
+        );
+        assert_eq!(
+            default_resume_template("muse", true).as_deref(),
+            Some("cd {cwd_shell} && muse resume {session_id}")
+        );
+    }
 }

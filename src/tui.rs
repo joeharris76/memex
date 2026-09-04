@@ -9032,6 +9032,7 @@ mod tests {
             session_id: "session".to_string(),
             project: "project".to_string(),
             source: SourceKind::Claude,
+            title: String::new(),
             last_ts: 100,
             hit_count: 2,
             top_score: 1.0,
@@ -9098,5 +9099,70 @@ mod tests {
                 .iter()
                 .any(|t| t.contains("no matches for role 'tool_use'"))
         );
+    }
+
+    #[test]
+    fn test_resolve_tantivy_project_filter_expands_repository_worktrees() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let paths = Paths::new(Some(tmp.path().join("memex"))).expect("paths");
+        paths.ensure_dirs().expect("dirs");
+
+        // 1. None project returns (None, None)
+        assert_eq!(
+            resolve_tantivy_project_filter(&paths, None, ProjectGrouping::Repository),
+            (None, None)
+        );
+
+        // 2. Flat grouping returns (Some(project), None)
+        assert_eq!(
+            resolve_tantivy_project_filter(&paths, Some("memex"), ProjectGrouping::Flat),
+            (Some("memex".to_string()), None)
+        );
+
+        // 3. Repository grouping without analytics db falls back to (Some(project), None)
+        assert_eq!(
+            resolve_tantivy_project_filter(&paths, Some("memex"), ProjectGrouping::Repository),
+            (Some("memex".to_string()), None)
+        );
+
+        // 4. Populate analytics db with worktrees belonging to repo "memex_repo"
+        let repo_dir = tmp.path().join("memex_repo");
+        std::fs::create_dir_all(repo_dir.join(".git")).expect("mkdir repo .git");
+        let wt_path = tmp.path().join("memex_repo.wt-feat");
+        let transcript1 = tmp.path().join("session1.jsonl");
+        std::fs::write(
+            &transcript1,
+            format!("{{\"cwd\":\"{}\"}}\n", wt_path.display()),
+        )
+        .expect("write transcript1");
+        let transcript2 = tmp.path().join("session2.jsonl");
+        std::fs::write(
+            &transcript2,
+            format!("{{\"cwd\":\"{}\"}}\n", repo_dir.display()),
+        )
+        .expect("write transcript2");
+
+        let mut r1 = record("user", "test");
+        r1.project = "memex_repo.wt-feat".to_string();
+        r1.session_id = "s1".to_string();
+        r1.source_path = transcript1.to_string_lossy().to_string();
+        r1.ts = 10;
+
+        let mut r2 = record("user", "test");
+        r2.project = "memex_repo".to_string();
+        r2.session_id = "s2".to_string();
+        r2.source_path = transcript2.to_string_lossy().to_string();
+        r2.ts = 20;
+
+        let db = crate::analytics::analytics_path(&paths.state);
+        crate::analytics::rebuild_from_records(&db, [r1, r2]).expect("rebuild");
+
+        // 5. Repository grouping with analytics db expands to all matching projects
+        let (single, multiple) =
+            resolve_tantivy_project_filter(&paths, Some("memex_repo"), ProjectGrouping::Repository);
+        assert_eq!(single, None);
+        let mut projects = multiple.expect("expanded projects");
+        projects.sort();
+        assert_eq!(projects, vec!["memex_repo", "memex_repo.wt-feat"]);
     }
 }
