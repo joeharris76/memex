@@ -11,7 +11,7 @@ use crate::usage::{
 use crate::vector::VectorIndex;
 use anyhow::{Context, Result, anyhow, bail};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -166,6 +166,11 @@ pub struct UsageSpec {
     pub cost_mode: CostMode,
     pub include_events: bool,
     pub memo_ttl_ms: u64,
+    /// Origin filter (`interactive` / `subagent` / `all`). `None` and `All`
+    /// both mean no restriction; kept `Option` for RPC compatibility with
+    /// peers that predate the field.
+    #[serde(default)]
+    pub kind: Option<SessionKindFilter>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1105,7 +1110,7 @@ fn usage_local(paths: &Paths, config: &UserConfig, spec: &UsageSpec) -> Result<U
     if !config.token_usage_enabled() {
         bail!("token usage tracking is disabled on this machine");
     }
-    let report = scan_usage(&usage_query(paths, spec))?;
+    let report = scan_usage(&usage_query(paths, spec)?)?;
     let details = report
         .details
         .iter()
@@ -1138,7 +1143,7 @@ fn usage_activity_local(
     if !config.token_usage_enabled() {
         bail!("token usage tracking is disabled on this machine");
     }
-    let (points, partial) = scan_usage_activity(&usage_query(paths, spec))?;
+    let (points, partial) = scan_usage_activity(&usage_query(paths, spec)?)?;
     Ok((
         points
             .into_iter()
@@ -1177,22 +1182,65 @@ fn session_activity_local(
         .collect())
 }
 
-fn usage_query(paths: &Paths, spec: &UsageSpec) -> UsageQuery {
-    UsageQuery {
+/// Session keys allowed by an origin filter, resolved against the local
+/// analytics store. Keys collapse to usage-event coordinates
+/// `(source label, session id)`; codex storage variants collapse via
+/// `label()`, matching `scan_usage_activity`'s
+/// `(event.source, session_id)` check. Returns an error when the analytics
+/// store cannot be opened so callers surface it instead of silently
+/// showing unfiltered totals.
+pub(crate) fn usage_session_keys_for_kind(
+    paths: &Paths,
+    kind: SessionKindFilter,
+) -> Result<HashSet<(String, String)>> {
+    let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
+    let rows =
+        store.query_sessions_filtered(None, None, None, ProjectGrouping::Flat, Some(kind), None)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| (row.source.label().to_string(), row.session_id))
+        .collect())
+}
+
+/// Intersects an explicit session-key filter (e.g. from a text search) with
+/// the origin filter. Either side being unrestricted leaves the other side.
+fn apply_kind_to_session_keys(
+    session_keys: Option<HashSet<(String, String)>>,
+    kind: Option<SessionKindFilter>,
+    allowed: Option<HashSet<(String, String)>>,
+) -> Option<HashSet<(String, String)>> {
+    let kind = kind.unwrap_or(SessionKindFilter::All);
+    if kind == SessionKindFilter::All {
+        return session_keys;
+    }
+    let allowed = allowed?;
+    Some(match session_keys {
+        Some(keys) => keys.intersection(&allowed).cloned().collect(),
+        None => allowed,
+    })
+}
+
+fn usage_query(paths: &Paths, spec: &UsageSpec) -> Result<UsageQuery> {
+    let session_keys: Option<HashSet<(String, String)>> = spec
+        .session_keys
+        .as_ref()
+        .map(|keys| keys.iter().cloned().collect());
+    let allowed = match spec.kind.unwrap_or(SessionKindFilter::All) {
+        SessionKindFilter::All => None,
+        kind => Some(usage_session_keys_for_kind(paths, kind)?),
+    };
+    Ok(UsageQuery {
         source: spec.source,
         project: spec.project.clone(),
         project_grouping: spec.project_grouping,
-        session_keys: spec
-            .session_keys
-            .as_ref()
-            .map(|keys| keys.iter().cloned().collect()),
+        session_keys: apply_kind_to_session_keys(session_keys, spec.kind, allowed),
         since_ms: spec.since_ms,
         until_ms: spec.until_ms,
         cost_mode: spec.cost_mode,
         include_events: spec.include_events,
         cache_path: Some(paths.state.join("usage-cache.sqlite3")),
         memo_ttl_ms: spec.memo_ttl_ms,
-    }
+    })
 }
 
 fn merge_usage_reports(
@@ -2234,6 +2282,7 @@ mod tests {
             cost_mode: CostMode::Source,
             include_events: false,
             memo_ttl_ms: 0,
+            kind: None,
         };
 
         let local = usage_spec_for_machine(&spec, "local");
@@ -2251,6 +2300,97 @@ mod tests {
         assert_eq!(other.session_keys, Some(Vec::new()));
         assert!(local.machine_session_keys.is_none());
         assert!(mini.machine_session_keys.is_none());
+    }
+
+    #[test]
+    fn usage_query_resolves_origin_filter_against_analytics() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+        let mut analytics =
+            AnalyticsWriter::open(analytics_path(&paths.state)).expect("analytics writer");
+        for (session_id, kind) in [("main-ses", None), ("sub-ses", Some("subagent"))] {
+            analytics
+                .record(&Record {
+                    source: SourceKind::Codex,
+                    doc_id: 1,
+                    ts: 10,
+                    project: "memex".to_string(),
+                    session_id: session_id.to_string(),
+                    turn_id: 1,
+                    role: "user".to_string(),
+                    text: "hello".to_string(),
+                    tool_name: None,
+                    tool_input: None,
+                    tool_output: None,
+                    links: RecordLinks {
+                        conversation_kind: kind.map(str::to_string),
+                        ..RecordLinks::default()
+                    },
+                    source_path: format!("{session_id}.jsonl"),
+                })
+                .expect("record session");
+        }
+        analytics.flush().expect("flush analytics");
+
+        let spec = |kind: Option<SessionKindFilter>,
+                    session_keys: Option<Vec<(String, String)>>| {
+            UsageSpec {
+                source: None,
+                project: None,
+                project_grouping: ProjectGrouping::Flat,
+                session_keys,
+                machine_session_keys: None,
+                since_ms: None,
+                until_ms: None,
+                cost_mode: CostMode::Source,
+                include_events: false,
+                memo_ttl_ms: 0,
+                kind,
+            }
+        };
+
+        let sub = usage_query(&paths, &spec(Some(SessionKindFilter::Subagent), None))
+            .expect("subagent query");
+        assert_eq!(
+            sub.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "sub-ses".to_string()
+            )]))
+        );
+
+        let primary = usage_query(&paths, &spec(Some(SessionKindFilter::Primary), None))
+            .expect("primary query");
+        assert_eq!(
+            primary.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "main-ses".to_string()
+            )]))
+        );
+
+        let all =
+            usage_query(&paths, &spec(Some(SessionKindFilter::All), None)).expect("all query");
+        assert!(all.session_keys.is_none());
+
+        let none = usage_query(&paths, &spec(None, None)).expect("unfiltered query");
+        assert!(none.session_keys.is_none());
+
+        // An explicit text-search filter intersects with the origin filter.
+        let both = vec![
+            ("codex".to_string(), "main-ses".to_string()),
+            ("codex".to_string(), "sub-ses".to_string()),
+        ];
+        let intersected = usage_query(&paths, &spec(Some(SessionKindFilter::Subagent), Some(both)))
+            .expect("intersected query");
+        assert_eq!(
+            intersected.session_keys,
+            Some(HashSet::from([(
+                "codex".to_string(),
+                "sub-ses".to_string()
+            )]))
+        );
     }
 
     #[test]

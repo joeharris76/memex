@@ -1490,7 +1490,8 @@ impl App {
                 .map(|(_, source, session_id)| (source.clone(), session_id.clone()))
                 .collect()
         });
-        let query = home_token_usage_query(
+        let session_kind = self.session_kind;
+        let mut query = home_token_usage_query(
             self.source,
             &self.project,
             self.project_display.grouping(),
@@ -1516,6 +1517,7 @@ impl App {
                         cost_mode: query.cost_mode,
                         include_events: false,
                         memo_ttl_ms: query.memo_ttl_ms,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(events, partial)| {
@@ -1546,6 +1548,23 @@ impl App {
                     }),
                 };
                 return;
+            }
+            // A text search already restricts `session_keys` to the
+            // origin-filtered results; with an empty query the usage scan
+            // is otherwise unfiltered, so resolve the origin here.
+            if query.session_keys.is_none()
+                && session_kind != crate::analytics::SessionKindFilter::All
+            {
+                match crate::machine::usage_session_keys_for_kind(&paths, session_kind) {
+                    Ok(keys) => query.session_keys = Some(keys),
+                    Err(error) => {
+                        let _ = tx.send(SearchUpdate::HomeTokenActivityError {
+                            request_id,
+                            message: error.to_string(),
+                        });
+                        return;
+                    }
+                }
             }
             let result = scan_usage_activity(&query).map(|(events, partial)| {
                 let points = events
@@ -1773,13 +1792,14 @@ impl App {
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
         let range_changed = range_selection && self.home_activity_range != previous_range;
-        let token_filter_changed = machine_changed || source_changed || project_changed;
+        let token_filter_changed =
+            machine_changed || source_changed || project_changed || kind_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed || kind_changed || range_changed {
+            if token_filter_changed || range_changed {
                 self.kickoff_home_activity();
             }
         } else if range_changed {
@@ -7839,6 +7859,24 @@ mod tests {
             crate::analytics::SessionKindFilter::Subagent
         );
         assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_change_reloads_token_chart() {
+        let (_tmp, mut app) = test_app();
+        app.config.token_usage = Some(true);
+        app.home_chart_mode = HomeChartMode::Tokens;
+        app.home_token_activity_state = LoadState::Loaded;
+        // Default filter is primary at index 1 in all/interactive/subagent order.
+        app.open_home_dropdown(HomeDropdown::Kind);
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
+        // The origin change must kick a token reload, not leave stale totals.
+        assert_eq!(app.home_token_activity_state, LoadState::Loading);
     }
 
     #[test]

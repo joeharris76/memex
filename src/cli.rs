@@ -2342,6 +2342,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
                 cost_mode,
                 include_events,
                 memo_ttl_ms: 0,
+                kind: None,
             },
         )?;
         if json {
