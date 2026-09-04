@@ -1708,12 +1708,33 @@ fn display_project_name(project: &str) -> String {
 fn decode_encoded_project_path(project: &str) -> Option<String> {
     let trimmed = project.trim_matches('-');
     let lower = trimmed.to_lowercase();
-    if !(lower.starts_with("users-") || lower.starts_with("home-") || lower.contains("-users-")) {
+    let home = std::env::var("HOME").ok();
+    let home_user = home
+        .as_deref()
+        .and_then(|h| Path::new(h).file_name().and_then(|n| n.to_str()));
+    let starts_with_user = home_user
+        .map(|u| lower.starts_with(&format!("{}-", u.to_lowercase())))
+        .unwrap_or(false);
+
+    if !(lower.starts_with("users-")
+        || lower.starts_with("home-")
+        || lower.contains("-users-")
+        || starts_with_user)
+    {
         return None;
     }
     let parts: Vec<&str> = trimmed.split('-').filter(|part| !part.is_empty()).collect();
-    if parts.len() < 3 {
+    if parts.len() < 2 {
         return None;
+    }
+
+    if let Some(user) = home_user
+        && parts[0].eq_ignore_ascii_case(user)
+    {
+        let tail = parts.get(1..)?;
+        if !tail.is_empty() {
+            return Some(encoded_tail_display(tail));
+        }
     }
 
     if let Some(home) = home_relative_encoded_path(&parts) {
@@ -1770,6 +1791,10 @@ fn encoded_tail_display(tail: &[&str]) -> String {
         "dev",
         "work",
         "documents",
+        "developer",
+        "development",
+        "workspace",
+        "workspaces",
     ];
     if common_dirs.contains(&tail[0].to_lowercase().as_str()) && tail.len() > 1 {
         return tail[1..].join("-");
@@ -2876,6 +2901,15 @@ mod tests {
             "sidequery-backend"
         );
         assert_eq!(display_project_name("model-serving"), "model-serving");
+        let _guard = crate::test_support::EnvVarGuard::set(&[("HOME", Some("/Users/joe"))]);
+        assert_eq!(
+            display_project_name("joe-Developer-continual-agent-mvp"),
+            "continual-agent-mvp"
+        );
+        assert_eq!(
+            display_project_name("-Users-joe-Developer-BenchBox"),
+            "BenchBox"
+        );
     }
 
     #[test]
