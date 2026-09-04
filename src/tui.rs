@@ -5348,39 +5348,28 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
 
 fn sessions_from_query(
     index: &SearchIndex,
-    query: &str,
-    source: Option<SourceFilter>,
-    project: Option<&str>,
-    role: Option<&str>,
-    since: Option<u64>,
-    limit: usize,
+    mut options: QueryOptions,
 ) -> Result<Vec<SessionSummary>> {
-    let options = QueryOptions {
-        query: query.to_string(),
-        project: project.map(|s| s.to_string()),
-        projects: None,
-        role: role.map(|s| s.to_string()),
-        tool: None,
-        session_id: None,
-        session_scope: None,
-        source,
-        since,
-        until: None,
-        limit: limit.max(20),
-    };
+    let query_is_empty = options.query.trim().is_empty();
+    let limit = options.limit.max(20);
+    options.limit = limit;
     let results = index.search(&options)?;
     let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
-    let matchers = crate::cli::build_matchers(query)?;
+    let matchers = crate::cli::build_matchers(&options.query)?;
     for (score, record) in results {
         add_record_to_session(&mut sessions, score, record, &matchers);
     }
     let mut out: Vec<SessionSummary> = sessions.into_values().collect();
-    out.sort_by(|a, b| {
-        b.top_score
-            .partial_cmp(&a.top_score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-            .then_with(|| b.last_ts.cmp(&a.last_ts))
-    });
+    if query_is_empty {
+        out.sort_by_key(|a| std::cmp::Reverse(a.last_ts));
+    } else {
+        out.sort_by(|a, b| {
+            b.top_score
+                .partial_cmp(&a.top_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.last_ts.cmp(&a.last_ts))
+        });
+    }
     if out.len() > limit {
         out.truncate(limit);
     }
@@ -5406,38 +5395,21 @@ fn sessions_from_recent(
     source: Option<SourceFilter>,
     role: Option<&str>,
     since: Option<u64>,
-    project: Option<&str>,
+    project: Option<String>,
+    projects: Option<Vec<String>>,
 ) -> Result<Vec<SessionSummary>> {
-    let record_limit = (RECENT_SESSIONS_LIMIT * RECENT_RECORDS_MULTIPLIER).max(200);
-    let records = index.recent_records(record_limit)?;
-    let mut sessions: HashMap<String, SessionSummary> = HashMap::new();
-    for record in records {
-        if since.is_some_and(|start| record.ts < start) {
-            continue;
-        }
-        if let Some(source_filter) = source
-            && !source_filter.matches(record.source)
-        {
-            continue;
-        }
-        if let Some(role_filter) = role
-            && !record.role.eq_ignore_ascii_case(role_filter)
-        {
-            continue;
-        }
-        if let Some(project_filter) = project
-            && record.project != project_filter
-        {
-            continue;
-        }
-        add_record_to_session(&mut sessions, 0.0, record, &[]);
-        if sessions.len() >= RECENT_SESSIONS_LIMIT {
-            break;
-        }
-    }
-    let mut out: Vec<SessionSummary> = sessions.into_values().collect();
-    out.sort_by_key(|summary| std::cmp::Reverse(summary.last_ts));
-    Ok(out)
+    sessions_from_query(
+        index,
+        QueryOptions {
+            source,
+            role: role.map(str::to_string),
+            since,
+            project,
+            projects,
+            limit: RESULT_LIMIT * 5,
+            ..Default::default()
+        },
+    )
 }
 
 #[allow(dead_code)]
@@ -5509,6 +5481,7 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
     }
 }
 
+#[allow(dead_code)]
 fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
     let codex_ids = sessions
         .iter()
@@ -5533,6 +5506,7 @@ fn enrich_session_titles(index: &SearchIndex, sessions: &mut [SessionSummary]) {
     }
 }
 
+#[allow(dead_code)]
 fn first_user_prompt(index: &SearchIndex, session: &SessionSummary) -> Option<String> {
     let mut records = index.records_by_session_id(&session.session_id).ok()?;
     records.retain(|record| {
@@ -5585,6 +5559,32 @@ fn enrich_session_projects(
     }
 }
 
+fn resolve_tantivy_project_filter(
+    paths: &Paths,
+    project: Option<&str>,
+    grouping: ProjectGrouping,
+) -> (Option<String>, Option<Vec<String>>) {
+    let Some(project) = project else {
+        return (None, None);
+    };
+    if grouping == ProjectGrouping::Flat {
+        return (Some(project.to_string()), None);
+    }
+    let db = analytics_path(&paths.state);
+    if db.exists()
+        && let Ok(store) = AnalyticsStore::open_read_only(&db)
+        && let Ok(matching) = store.raw_projects_for_repository(project)
+    {
+        let mut all_projects = matching;
+        if !all_projects.iter().any(|p| p == project) {
+            all_projects.push(project.to_string());
+        }
+        (None, Some(all_projects))
+    } else {
+        (Some(project.to_string()), None)
+    }
+}
+
 fn collect_projects_from_analytics(
     paths: &Paths,
     source: Option<SourceFilter>,
@@ -5617,13 +5617,16 @@ fn build_project_timeline(
             .collect()
     } else {
         let index = SearchIndex::open_or_create(&paths.index)?;
-        let record_limit = if kind == crate::analytics::SessionKindFilter::All {
-            RESULT_LIMIT
-        } else {
-            RESULT_LIMIT * 5
-        };
-        let mut sessions =
-            sessions_from_query(&index, query, source, None, None, since, record_limit)?;
+        let mut sessions = sessions_from_query(
+            &index,
+            QueryOptions {
+                query: query.to_string(),
+                source,
+                since,
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
+        )?;
         sessions.retain(|session| kind.matches_kind(session.conversation_kind.as_deref()));
         sessions.truncate(RESULT_LIMIT);
         enrich_session_projects(paths, &mut sessions, display.grouping());
@@ -5800,7 +5803,7 @@ fn run_search_request(
 ) -> SearchRequestResult {
     let project = (!request.project.is_empty()).then_some(request.project.as_str());
     if !config.machines.is_empty() {
-        let federated = if request.query.is_empty() {
+        let federated = if request.query.is_empty() && request.role == RoleChoice::All {
             federated_recent(
                 paths,
                 config,
@@ -5878,75 +5881,63 @@ fn run_search_request(
         sessions.truncate(RESULT_LIMIT);
         return Ok((sessions, failures));
     }
-    if request.query.is_empty() {
-        if request.role == RoleChoice::All {
-            let mut sessions = sessions_from_analytics_filtered(
-                paths,
-                request.source.as_filter(),
-                request.since,
-                project,
-                request.grouping,
-                Some(request.kind),
-            )
-            .or_else(|_| {
-                let mut sessions = sessions_from_recent(
-                    index,
-                    request.source.as_filter(),
-                    None,
-                    request.since,
-                    project,
-                )?;
-                sessions.retain(|session| {
-                    session_matches_kind(request.kind, session.conversation_kind.as_deref())
-                });
-                if sessions.is_empty() {
-                    anyhow::bail!("no analytics sessions");
-                }
-                Ok(sessions)
-            })?;
-            enrich_session_titles(index, &mut sessions);
-            sessions.retain(|session| {
-                session_matches_kind(request.kind, session.conversation_kind.as_deref())
-            });
-            return Ok((sessions, Vec::new()));
-        } else {
+    if request.query.is_empty() && request.role == RoleChoice::All {
+        return sessions_from_analytics_filtered(
+            paths,
+            request.source.as_filter(),
+            request.since,
+            project,
+            request.grouping,
+            Some(request.kind),
+        )
+        .or_else(|_| {
+            let (tantivy_project, tantivy_projects) =
+                resolve_tantivy_project_filter(paths, project, request.grouping);
             let mut sessions = sessions_from_recent(
                 index,
                 request.source.as_filter(),
                 request.role.as_str(),
                 request.since,
-                project,
+                tantivy_project,
+                tantivy_projects,
             )?;
             enrich_session_projects(paths, &mut sessions, request.grouping);
+            if let Some(project) = project {
+                sessions.retain(|session| session.project == project);
+            }
             sessions.retain(|session| {
                 session_matches_kind(request.kind, session.conversation_kind.as_deref())
             });
-            sessions.truncate(RESULT_LIMIT);
-            return Ok((sessions, Vec::new()));
-        }
+            if sessions.is_empty() {
+                anyhow::bail!("no analytics sessions");
+            }
+            Ok(sessions)
+        })
+        .map(|sessions| (sessions, Vec::new()));
     }
 
-    let tantivy_project = if request.grouping == ProjectGrouping::Flat {
-        project
-    } else {
-        None
-    };
+    let (tantivy_project, tantivy_projects) =
+        resolve_tantivy_project_filter(paths, project, request.grouping);
     // Over-fetch when an origin filter is active: the kind filter applies
     // after grouping, so capping the record query at RESULT_LIMIT first
     // could starve interactive matches in subagent-heavy corpora.
     let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {
-        RESULT_LIMIT
+        (RESULT_LIMIT * 5).max(500)
     } else {
-        RESULT_LIMIT * 5
+        (RESULT_LIMIT * 10).max(1000)
     };
     let mut sessions = sessions_from_query(
         index,
-        &request.query,
-        request.source.as_filter(),
-        tantivy_project,
-        request.role.as_str(),
-        request.since,
-        record_limit,
+        QueryOptions {
+            query: request.query.clone(),
+            source: request.source.as_filter(),
+            project: tantivy_project,
+            projects: tantivy_projects,
+            role: request.role.as_str().map(str::to_string),
+            since: request.since,
+            limit: record_limit,
+            ..Default::default()
+        },
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
@@ -8506,12 +8497,12 @@ mod tests {
 
         let sessions = sessions_from_query(
             &app.index,
-            "needle",
-            None,
-            None,
-            None,
-            Some(50),
-            RESULT_LIMIT,
+            QueryOptions {
+                query: "needle".to_string(),
+                since: Some(50),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
         )
         .expect("search");
 
@@ -8904,12 +8895,12 @@ mod tests {
 
         let user_only = sessions_from_query(
             &app.index,
-            "unique_keyword",
-            None,
-            None,
-            Some("user"),
-            None,
-            RESULT_LIMIT,
+            QueryOptions {
+                query: "unique_keyword".to_string(),
+                role: Some("user".to_string()),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
         )
         .expect("search user");
         assert_eq!(user_only.len(), 1);
@@ -8917,12 +8908,12 @@ mod tests {
 
         let asst_only = sessions_from_query(
             &app.index,
-            "unique_keyword",
-            None,
-            None,
-            Some("assistant"),
-            None,
-            RESULT_LIMIT,
+            QueryOptions {
+                query: "unique_keyword".to_string(),
+                role: Some("assistant".to_string()),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
         )
         .expect("search asst");
         assert_eq!(asst_only.len(), 1);
@@ -8930,15 +8921,108 @@ mod tests {
 
         let all = sessions_from_query(
             &app.index,
-            "unique_keyword",
-            None,
-            None,
-            None,
-            None,
-            RESULT_LIMIT,
+            QueryOptions {
+                query: "unique_keyword".to_string(),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
         )
         .expect("search all");
         assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn sessions_from_query_empty_query_filters_by_role_and_orders_by_recency() {
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().expect("writer");
+
+        let mut user1 = record("user", "first user prompt");
+        user1.doc_id = 1;
+        user1.ts = 1000;
+        user1.session_id = "user_session_older".to_string();
+        user1.source_path = "user1.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &user1)
+            .expect("add user1");
+
+        let mut asst_rec = record("assistant", "intermediate assistant message");
+        asst_rec.doc_id = 2;
+        asst_rec.ts = 2000;
+        asst_rec.session_id = "asst_session".to_string();
+        asst_rec.source_path = "asst.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &asst_rec)
+            .expect("add asst");
+
+        let mut user2 = record("user", "second user prompt");
+        user2.doc_id = 3;
+        user2.ts = 3000;
+        user2.session_id = "user_session_newer".to_string();
+        user2.source_path = "user2.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &user2)
+            .expect("add user2");
+
+        writer.commit().expect("commit");
+
+        let user_sessions = sessions_from_query(
+            &app.index,
+            QueryOptions {
+                role: Some("user".to_string()),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
+        )
+        .expect("empty query user role search");
+
+        assert_eq!(user_sessions.len(), 2);
+        assert_eq!(user_sessions[0].session_id, "user_session_newer");
+        assert_eq!(user_sessions[1].session_id, "user_session_older");
+    }
+
+    #[test]
+    fn sessions_from_query_matches_multiple_projects() {
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().expect("writer");
+
+        let mut rec1 = record("user", "prompt");
+        rec1.doc_id = 1;
+        rec1.project = "repo-main".to_string();
+        rec1.session_id = "session1".to_string();
+        rec1.source_path = "rec1.jsonl".to_string();
+        app.index.add_record(&mut writer, &rec1).expect("add rec1");
+
+        let mut rec2 = record("user", "prompt");
+        rec2.doc_id = 2;
+        rec2.project = "repo-worktree-1".to_string();
+        rec2.session_id = "session2".to_string();
+        rec2.source_path = "rec2.jsonl".to_string();
+        app.index.add_record(&mut writer, &rec2).expect("add rec2");
+
+        let mut rec3 = record("user", "prompt");
+        rec3.doc_id = 3;
+        rec3.project = "other-repo".to_string();
+        rec3.session_id = "session3".to_string();
+        rec3.source_path = "rec3.jsonl".to_string();
+        app.index.add_record(&mut writer, &rec3).expect("add rec3");
+
+        writer.commit().expect("commit");
+
+        let matched = sessions_from_query(
+            &app.index,
+            QueryOptions {
+                projects: Some(vec!["repo-main".to_string(), "repo-worktree-1".to_string()]),
+                role: Some("user".to_string()),
+                limit: RESULT_LIMIT,
+                ..Default::default()
+            },
+        )
+        .expect("search");
+
+        assert_eq!(matched.len(), 2);
+        let ids: Vec<_> = matched.into_iter().map(|s| s.session_id).collect();
+        assert!(ids.contains(&"session1".to_string()));
+        assert!(ids.contains(&"session2".to_string()));
     }
 
     #[test]

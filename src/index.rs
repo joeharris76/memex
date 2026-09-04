@@ -949,7 +949,14 @@ impl SearchIndex {
         let reader = self.reader()?;
         let searcher = reader.searcher();
         let query = build_query(&self.fields, options, &self.index)?;
-        let top_docs = searcher.search(&query, &TopDocs::with_limit(options.limit))?;
+        let top_docs: Vec<(f32, tantivy::DocAddress)> = if options.query.trim().is_empty() {
+            let collector = TopDocs::with_limit(options.limit.max(1))
+                .order_by_fast_field::<u64>("ts", Order::Desc);
+            let hits = searcher.search(&query, &collector)?;
+            hits.into_iter().map(|(_ts, addr)| (1.0, addr)).collect()
+        } else {
+            searcher.search(&query, &TopDocs::with_limit(options.limit.max(1)))?
+        };
         let mut results = Vec::with_capacity(top_docs.len());
         for (score, addr) in top_docs {
             let doc = searcher.doc::<TantivyDocument>(addr)?;
@@ -3110,6 +3117,30 @@ mod tests {
             })
             .expect("search");
         assert_eq!(matched.len(), 0);
+    }
+
+    #[test]
+    fn empty_query_orders_by_timestamp_descending() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut older = test_record(1, "message one");
+        older.ts = 1000;
+        let mut newer = test_record(2, "message two");
+        newer.ts = 2000;
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &older).expect("older");
+        index.add_record(&mut writer, &newer).expect("newer");
+        writer.commit().expect("commit");
+
+        let options = QueryOptions {
+            query: "".to_string(),
+            limit: 10,
+            ..Default::default()
+        };
+        let results = index.search(&options).expect("search");
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].1.doc_id, 2);
+        assert_eq!(results[1].1.doc_id, 1);
     }
 
     #[test]
