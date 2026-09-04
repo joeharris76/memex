@@ -153,10 +153,11 @@ impl Directory for SealedDirectory {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct QueryOptions {
     pub query: String,
     pub project: Option<String>,
+    pub projects: Option<Vec<String>>,
     pub role: Option<String>,
     pub tool: Option<String>,
     pub session_id: Option<String>,
@@ -2346,7 +2347,21 @@ fn build_query(
         clauses.push((Occur::Must, text_query));
     }
 
-    if let Some(project) = &options.project {
+    if let Some(projects) = &options.projects {
+        let project_clauses: Vec<(Occur, Box<dyn Query>)> = projects
+            .iter()
+            .map(|p| {
+                let term = Term::from_field_text(fields.project, p);
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        if !project_clauses.is_empty() {
+            clauses.push((Occur::Must, Box::new(BooleanQuery::new(project_clauses))));
+        }
+    } else if let Some(project) = &options.project {
         let term = Term::from_field_text(fields.project, project);
         clauses.push((
             Occur::Must,
@@ -2911,6 +2926,7 @@ mod tests {
         let options = QueryOptions {
             query: "shared needle".to_string(),
             project: None,
+            projects: None,
             role: None,
             tool: None,
             session_id: None,
@@ -2988,6 +3004,7 @@ mod tests {
             let options = QueryOptions {
                 query: "shared needle".to_string(),
                 project: None,
+                projects: None,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -3036,6 +3053,38 @@ mod tests {
                     .is_empty()
             );
         }
+    }
+
+    #[test]
+    fn projects_query_matches_any_specified_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut first = test_record(1, "findme");
+        first.project = "repo-main".to_string();
+        let mut second = test_record(2, "findme");
+        second.project = "repo-wt1".to_string();
+        let mut third = test_record(3, "findme");
+        third.project = "unrelated-repo".to_string();
+
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &first).expect("first");
+        index.add_record(&mut writer, &second).expect("second");
+        index.add_record(&mut writer, &third).expect("third");
+        writer.commit().expect("commit");
+
+        let matched = index
+            .search(&QueryOptions {
+                query: "findme".to_string(),
+                projects: Some(vec!["repo-main".to_string(), "repo-wt1".to_string()]),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search");
+        assert_eq!(matched.len(), 2);
+        let matched_ids: Vec<u64> = matched.iter().map(|(_, r)| r.doc_id).collect();
+        assert!(matched_ids.contains(&1));
+        assert!(matched_ids.contains(&2));
+        assert!(!matched_ids.contains(&3));
     }
 
     #[test]
@@ -3438,6 +3487,7 @@ mod tests {
             .search(&QueryOptions {
                 query: query.to_string(),
                 project: None,
+                projects: None,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -3447,8 +3497,8 @@ mod tests {
                 until: None,
                 limit: 10,
             })
-            .expect("search")
-            .len()
+            .map(|r| r.len())
+            .unwrap_or(0)
     }
 
     #[cfg(unix)]
@@ -3532,6 +3582,7 @@ mod tests {
                     .search(&QueryOptions {
                         query: format!("unique{doc_id}"),
                         project: None,
+                        projects: None,
                         role: None,
                         tool: None,
                         session_id: None,
@@ -3571,6 +3622,7 @@ mod tests {
                 .search(&QueryOptions {
                     query: "preserved".to_string(),
                     project: None,
+                    projects: None,
                     role: None,
                     tool: None,
                     session_id: None,
@@ -3610,6 +3662,7 @@ mod tests {
             .search(&QueryOptions {
                 query: "needle".to_string(),
                 project: None,
+                projects: None,
                 role: None,
                 tool: None,
                 session_id: None,

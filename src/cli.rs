@@ -3138,6 +3138,7 @@ fn collect_search_with_auto_index(
     let options = QueryOptions {
         query,
         project,
+        projects: None,
         role,
         tool,
         session_id: session,
@@ -3973,6 +3974,7 @@ fn run_eval_retrieval(dataset_path: PathBuf, k: usize, root: Option<PathBuf>) ->
             let options = QueryOptions {
                 query,
                 project: None,
+                projects: None,
                 role: None,
                 tool: None,
                 session_id: None,
@@ -4962,6 +4964,7 @@ pub(crate) fn collect_session_count(
         let scopes = index.fast_session_scopes_matching_query(&QueryOptions {
             query,
             project: request.project,
+            projects: None,
             role: None,
             tool: None,
             session_id: request.session_id,

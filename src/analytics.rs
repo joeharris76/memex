@@ -104,6 +104,7 @@ pub struct AnalyticsWriter {
     metadata_cache: HashMap<SessionKey, SessionMetadata>,
     git_cache: HashMap<String, GitMetadata>,
     cwd_overrides: HashMap<SessionKey, String>,
+    opencode_cache: OpencodeLookupCache,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -202,7 +203,9 @@ impl AnalyticsStore {
         }
         self.conn.execute_batch(
             "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
-             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);",
+             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);
+             CREATE INDEX IF NOT EXISTS sessions_git_root_idx ON sessions(git_root);
+             CREATE INDEX IF NOT EXISTS sessions_git_common_dir_idx ON sessions(git_common_dir);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
@@ -867,6 +870,19 @@ impl AnalyticsStore {
         Ok(project.map(|project| display_project_name(&project)))
     }
 
+    pub fn raw_projects_for_repository(&self, repo: &str) -> Result<Vec<String>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT project FROM sessions
+             WHERE COALESCE(NULLIF(repo_project, ''), project) = ?1",
+        )?;
+        let rows = stmt.query_map([repo], |row| row.get(0))?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
     pub fn query_session_projects(
         &self,
         sessions: &[(SourceKind, String, String)],
@@ -929,6 +945,7 @@ impl AnalyticsWriter {
             metadata_cache: HashMap::new(),
             git_cache: HashMap::new(),
             cwd_overrides: HashMap::new(),
+            opencode_cache: OpencodeLookupCache::default(),
         })
     }
 
@@ -1049,10 +1066,9 @@ impl AnalyticsWriter {
                     conversation_kind = COALESCE(sessions.conversation_kind, excluded.conversation_kind)
                 "#,
             )?;
-            // OpenCode title/agent lookups hit the source SQLite database. Sessions
-            // from one database share the same file, so memoize per flush to
-            // avoid reopening it once per session during large index scans.
-            let mut opencode_cache = OpencodeLookupCache::default();
+            // OpenCode title/agent/cwd lookups hit the source SQLite database.
+            // Sessions from one database share the same file, so memoize in
+            // writer's opencode_cache to avoid reopening it repeatedly.
             for (session, metadata) in sessions {
                 let label = extract_session_label(
                     session.key.source,
@@ -1060,7 +1076,7 @@ impl AnalyticsWriter {
                     &session.key.session_id,
                     session.first_user_text.as_deref(),
                     metadata.cwd.as_deref(),
-                    &mut opencode_cache,
+                    &mut self.opencode_cache,
                 );
                 let conversation_kind = infer_session_kind(
                     session.key.source,
@@ -1069,7 +1085,7 @@ impl AnalyticsWriter {
                     session.conversation_kind.as_deref(),
                     metadata.cwd.as_deref(),
                     session.first_user_text.as_deref(),
-                    &mut opencode_cache,
+                    &mut self.opencode_cache,
                 );
                 stmt.execute(params![
                     session.key.source.storage_label(),
@@ -1105,7 +1121,12 @@ impl AnalyticsWriter {
 
     fn resolve_uncached_metadata(&mut self, key: &SessionKey) -> SessionMetadata {
         let cwd = self.cwd_overrides.get(key).cloned().or_else(|| {
-            resolve_session_cwd_from_parts(key.source, &key.source_path, &key.session_id)
+            resolve_session_cwd_from_parts(
+                key.source,
+                &key.source_path,
+                &key.session_id,
+                &mut self.opencode_cache,
+            )
         });
         let Some(cwd) = cwd else {
             return SessionMetadata {
@@ -1136,23 +1157,45 @@ struct GitMetadata {
     status: String,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorktreeRepoInfo {
+    repo_project: String,
+    git_root: Option<String>,
+    git_common_dir: Option<String>,
+}
+
 fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
     let deadline = Instant::now() + GIT_METADATA_TIMEOUT;
-    let root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
-    let common_dir = git_rev_parse(
+    let mut root = git_rev_parse(cwd, &["rev-parse", "--show-toplevel"], deadline);
+    let mut common_dir = git_rev_parse(
         cwd,
         &["rev-parse", "--path-format=absolute", "--git-common-dir"],
         deadline,
     );
+    let fallback = worktree_repo_project(cwd);
     let path_repo_project =
         claude_worktree_repo_project(cwd).or_else(|| codex_worktree_repo_project(cwd));
-    let repo_project = common_dir
+    let mut repo_project = common_dir
         .as_deref()
         .and_then(common_dir_project_name)
         .or_else(|| root.as_deref().and_then(path_file_name))
-        .or_else(|| path_repo_project.clone());
+        .or(path_repo_project);
 
-    let status = if repo_project.is_some() && root.is_none() && common_dir.is_none() {
+    let mut is_fallback = false;
+    if let Some(fb) = fallback
+        && (common_dir.is_none() || repo_project.is_none())
+    {
+        repo_project = Some(fb.repo_project);
+        if root.is_none() {
+            root = fb.git_root;
+        }
+        if common_dir.is_none() {
+            common_dir = fb.git_common_dir;
+        }
+        is_fallback = true;
+    }
+
+    let status = if is_fallback {
         "path-fallback"
     } else if repo_project.is_some() {
         "ok"
@@ -1175,18 +1218,95 @@ pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
     git_metadata_for_cwd(cwd).repo_project
 }
 
-fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
-    for ancestor in Path::new(cwd).ancestors() {
-        if ancestor.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
-            continue;
+fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
+    let path = Path::new(cwd);
+
+    // 1. Ancestor worktree paths (.claude/worktrees/*, .worktrees/*, or worktrees/*)
+    for ancestor in path.ancestors() {
+        let name = ancestor.file_name().and_then(|n| n.to_str());
+        if name == Some("worktrees") || name == Some(".worktrees") {
+            let parent = ancestor.parent()?;
+            let repo_dir = if parent.file_name().and_then(|n| n.to_str()) == Some(".claude") {
+                parent.parent()?
+            } else {
+                parent
+            };
+            let repo_name = path_file_name(repo_dir.to_string_lossy().as_ref())?;
+            let git_root = repo_dir.to_string_lossy().to_string();
+            let common_dir = repo_dir.join(".git");
+            let git_common_dir = if common_dir.exists() {
+                Some(common_dir.to_string_lossy().to_string())
+            } else {
+                Some(git_root.clone())
+            };
+            return Some(WorktreeRepoInfo {
+                repo_project: repo_name,
+                git_root: Some(git_root),
+                git_common_dir,
+            });
         }
-        let claude_dir = ancestor.parent()?;
-        if claude_dir.file_name().and_then(|n| n.to_str()) != Some(".claude") {
-            continue;
-        }
-        let repo_dir = claude_dir.parent()?;
-        return path_file_name(repo_dir.to_string_lossy().as_ref());
     }
+
+    // 2. Direct .git file check (when worktree directory exists on disk)
+    // Submodule protection: worktree gitdirs have a "commondir" file pointing to the main repo's git dir.
+    let git_file = path.join(".git");
+    if git_file.is_file()
+        && let Ok(content) = std::fs::read_to_string(&git_file)
+        && let Some(line) = content.lines().find(|l| l.starts_with("gitdir:"))
+    {
+        let gitdir_str = line["gitdir:".len()..].trim();
+        let gitdir_path = path.join(gitdir_str);
+        let commondir_file = gitdir_path.join("commondir");
+        if commondir_file.is_file()
+            && let Ok(common_str) = std::fs::read_to_string(&commondir_file)
+        {
+            let common_dir = gitdir_path.join(common_str.trim());
+            if let Ok(canonical_common) = common_dir.canonicalize() {
+                let repo_project =
+                    common_dir_project_name(canonical_common.to_string_lossy().as_ref())?;
+                let git_root =
+                    if canonical_common.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                        canonical_common
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
+                    } else {
+                        Some(canonical_common.to_string_lossy().to_string())
+                    };
+                return Some(WorktreeRepoInfo {
+                    repo_project,
+                    git_root,
+                    git_common_dir: Some(canonical_common.to_string_lossy().to_string()),
+                });
+            }
+        }
+    }
+
+    // 3. Sibling worktree naming convention (handles deleted worktrees)
+    // Common delimiters: .wt-, -wt-, .wt/, .worktree-, -worktree-
+    let leaf = path.file_name().and_then(|n| n.to_str())?;
+    for delimiter in [".wt-", ".wt/", "-wt-", ".worktree-", "-worktree-"] {
+        if let Some((repo_prefix, _)) = leaf.split_once(delimiter)
+            && !repo_prefix.is_empty()
+            && let Some(parent) = path.parent()
+        {
+            let candidate = parent.join(repo_prefix);
+            let candidate_git = candidate.join(".git");
+            if candidate_git.exists() || candidate.is_dir() {
+                let git_root = candidate.to_string_lossy().to_string();
+                let git_common_dir = if candidate_git.exists() {
+                    candidate_git.to_string_lossy().to_string()
+                } else {
+                    git_root.clone()
+                };
+                return Some(WorktreeRepoInfo {
+                    repo_project: repo_prefix.to_string(),
+                    git_root: Some(git_root),
+                    git_common_dir: Some(git_common_dir),
+                });
+            }
+        }
+    }
+
     None
 }
 
@@ -1209,6 +1329,10 @@ fn codex_worktree_repo_project(cwd: &str) -> Option<String> {
             .map(str::to_string);
     }
     None
+}
+
+fn claude_worktree_repo_project(cwd: &str) -> Option<String> {
+    worktree_repo_project(cwd).map(|info| info.repo_project)
 }
 
 fn git_rev_parse(cwd: &str, args: &[&str], deadline: Instant) -> Option<String> {
@@ -1354,6 +1478,7 @@ fn resolve_session_cwd_from_parts(
     source: SourceKind,
     source_path: &str,
     session_id: &str,
+    opencode: &mut OpencodeLookupCache,
 ) -> Option<String> {
     if source == SourceKind::Opencode && crate::sources::opencode::is_database_path(source_path) {
         return crate::sources::opencode::enumerate_sessions(Path::new(source_path))
@@ -1382,6 +1507,16 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd.to_string_lossy().to_string());
     }
+    if source == SourceKind::Cursor
+        && let Some(cwd) = crate::transfer::cwd_from_cursor_session(Path::new(source_path))
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Opencode
+        && let Some(cwd) = opencode.cwd(source_path, session_id)
+    {
+        return Some(cwd);
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
@@ -1402,6 +1537,7 @@ fn resolve_session_cwd_from_parts(
             .get("sessionId")
             .and_then(|v| v.as_str())
             .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
+            .or_else(|| value.get("id").and_then(|v| v.as_str()))
             .map(|s| s == session_id)
             .unwrap_or(false);
 
@@ -1422,8 +1558,10 @@ fn resolve_session_cwd_from_parts(
             }
         }
 
-        if matches!(source, SourceKind::Pi | SourceKind::OpenClaw)
-            && value.get("type").and_then(|v| v.as_str()) == Some("session")
+        if matches!(
+            source,
+            SourceKind::Pi | SourceKind::OpenClaw | SourceKind::Omp
+        ) && value.get("type").and_then(|v| v.as_str()) == Some("session")
         {
             let cwd = value
                 .get("cwd")
@@ -1861,13 +1999,59 @@ fn opencode_session_has_parent(db_path: &str, session_id: &str) -> bool {
     check().unwrap_or(false)
 }
 
-/// Memoized OpenCode source-database lookups for one flush. Titles and
-/// parent links are immutable per session, so caching across the sessions
-/// of a flush only collapses repeated reads of the same row.
+fn opencode_cwd_for_session(db_path: &str, session_id: &str) -> Option<String> {
+    let path = Path::new(db_path);
+    if !path.is_file() {
+        return None;
+    }
+    let conn = match Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return None,
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(1));
+
+    let mut stmt = conn
+        .prepare("SELECT directory, project_id FROM session WHERE id = ?1")
+        .ok()?;
+    let row: Option<(Option<String>, Option<String>)> = stmt
+        .query_row(params![session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+        .optional()
+        .ok()
+        .flatten();
+
+    let (directory, project_id) = row?;
+    if let Some(dir) = directory.filter(|d| !d.trim().is_empty()) {
+        return Some(dir);
+    }
+
+    if let Some(pid) = project_id.filter(|p| !p.trim().is_empty()) {
+        let mut proj_stmt = conn
+            .prepare("SELECT worktree FROM project WHERE id = ?1")
+            .ok()?;
+        let worktree: Option<String> = proj_stmt
+            .query_row(params![pid], |row| row.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        if let Some(wt) = worktree.filter(|w| !w.trim().is_empty()) {
+            return Some(wt);
+        }
+    }
+
+    None
+}
+
+/// Memoized OpenCode source-database lookups for one writer instance. Titles,
+/// parent links, and working directories are immutable per session, so caching
+/// collapses repeated reads of the same database and rows.
 #[derive(Default)]
 struct OpencodeLookupCache {
     titles: HashMap<(String, String), Option<String>>,
     parented: HashMap<(String, String), bool>,
+    cwds: HashMap<(String, String), Option<String>>,
 }
 
 impl OpencodeLookupCache {
@@ -1883,6 +2067,13 @@ impl OpencodeLookupCache {
             .parented
             .entry((db_path.to_string(), session_id.to_string()))
             .or_insert_with(|| opencode_session_has_parent(db_path, session_id))
+    }
+
+    fn cwd(&mut self, db_path: &str, session_id: &str) -> Option<String> {
+        self.cwds
+            .entry((db_path.to_string(), session_id.to_string()))
+            .or_insert_with(|| opencode_cwd_for_session(db_path, session_id))
+            .clone()
     }
 }
 
@@ -1963,6 +2154,15 @@ fn infer_session_kind(
             // classification can never disagree.
             if opencode.has_parent(source_path, session_id) {
                 return Some("fork".to_string());
+            }
+        }
+        SourceKind::Grok => {
+            // Same rule the grok parser stores (`grok_subagent_kind`), so
+            // parse-time and backfill classification can never disagree.
+            if let Some(kind) = crate::sources::grok::grok_subagent_kind(
+                crate::sources::grok::session_kind(Path::new(source_path)).as_deref(),
+            ) {
+                return Some(kind);
             }
         }
         // Match whole path components (like the Cursor parser's
@@ -2791,6 +2991,43 @@ mod tests {
     }
 
     #[test]
+    fn raw_projects_for_repository_finds_distinct_projects() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("memex");
+        fs::create_dir_all(repo_dir.join(".git")).expect("mkdir repo .git");
+        let wt_path = tmp.path().join("memex.wt-feat");
+        let transcript1 = tmp.path().join("session1.jsonl");
+        fs::write(
+            &transcript1,
+            format!("{{\"cwd\":\"{}\"}}\n", wt_path.display()),
+        )
+        .expect("write transcript1");
+        let transcript2 = tmp.path().join("session2.jsonl");
+        fs::write(
+            &transcript2,
+            format!("{{\"cwd\":\"{}\"}}\n", repo_dir.display()),
+        )
+        .expect("write transcript2");
+
+        let db = tmp.path().join("analytics.sqlite");
+        rebuild_from_records(
+            &db,
+            [
+                record("memex.wt-feat", "s1", &transcript1, 10),
+                record("memex", "s2", &transcript2, 20),
+            ],
+        )
+        .expect("rebuild");
+
+        let store = AnalyticsStore::open(&db).expect("open store");
+        let mut raw = store
+            .raw_projects_for_repository("memex")
+            .expect("raw projects");
+        raw.sort();
+        assert_eq!(raw, vec!["memex", "memex.wt-feat"]);
+    }
+
+    #[test]
     fn sanitize_label_collapses_whitespace_and_truncates() {
         let raw = "  Hello\n   world   \x1b[31mred\x1b[0m  <system-reminder>ignore</system-reminder>  this is a very long prompt that should be truncated at word boundary because it exceeds the one hundred fifty character limit significantly and we want to ensure ellipsis handling works correctly for display";
         let label = sanitize_label(raw);
@@ -2982,8 +3219,12 @@ mod tests {
             r#"{"id":"s-cwd","working_dir":"/repo/example","messages":[]}"#,
         )
         .expect("write");
-        let cwd =
-            resolve_session_cwd_from_parts(SourceKind::Jcode, &path.to_string_lossy(), "s-cwd");
+        let cwd = resolve_session_cwd_from_parts(
+            SourceKind::Jcode,
+            &path.to_string_lossy(),
+            "s-cwd",
+            &mut OpencodeLookupCache::default(),
+        );
         assert_eq!(cwd.as_deref(), Some("/repo/example"));
     }
 
@@ -3227,6 +3468,44 @@ mod tests {
     }
 
     #[test]
+    fn infer_session_kind_reads_grok_summary_subagent_family() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let session = tmp.path().join("session-id");
+        std::fs::create_dir_all(&session).expect("mkdir");
+        let updates = session.join("updates.jsonl");
+        std::fs::write(&updates, "").expect("write updates");
+        let infer = |summary_json: &str| {
+            std::fs::write(session.join("summary.json"), summary_json).expect("write summary");
+            infer_session_kind(
+                SourceKind::Grok,
+                updates.to_str().expect("utf8 path"),
+                "session-id",
+                None,
+                None,
+                None,
+                &mut OpencodeLookupCache::default(),
+            )
+        };
+        assert_eq!(
+            infer(r#"{"session_kind":"subagent","info":{"id":"session-id"}}"#).as_deref(),
+            Some("subagent")
+        );
+        assert_eq!(
+            infer(r#"{"session_kind":"subagent_resume","info":{"id":"session-id"}}"#).as_deref(),
+            Some("subagent_resume")
+        );
+        // Absent and non-subagent markers stay interactive.
+        assert_eq!(
+            infer(r#"{"info":{"id":"session-id"}}"#).as_deref(),
+            Some("main")
+        );
+        assert_eq!(
+            infer(r#"{"session_kind":"headless","info":{"id":"session-id"}}"#).as_deref(),
+            Some("main")
+        );
+    }
+
+    #[test]
     fn extract_session_label_falls_back_without_opencode_db() {
         let mut cache = OpencodeLookupCache::default();
         let label = extract_session_label(
@@ -3238,5 +3517,173 @@ mod tests {
             &mut cache,
         );
         assert_eq!(label.as_deref(), Some("hello world"));
+    }
+
+    #[test]
+    fn worktree_repo_info_resolves_from_git_file_with_commondir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let main_repo = tmp.path().join("main-project");
+        let main_git = main_repo.join(".git");
+        let wt_admin = main_git.join("worktrees").join("feature-wt");
+        fs::create_dir_all(&wt_admin).expect("mkdir wt_admin");
+        fs::write(wt_admin.join("commondir"), "../..\n").expect("write commondir");
+
+        let wt_workdir = tmp.path().join("feature-worktree");
+        fs::create_dir_all(&wt_workdir).expect("mkdir wt_workdir");
+        fs::write(
+            wt_workdir.join(".git"),
+            format!("gitdir: {}\n", wt_admin.display()),
+        )
+        .expect("write .git file");
+
+        let info = worktree_repo_project(wt_workdir.to_str().expect("utf8"));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.repo_project, "main-project");
+        assert_eq!(
+            info.git_root.as_deref(),
+            main_repo
+                .canonicalize()
+                .ok()
+                .map(|p| p.to_string_lossy().to_string())
+                .as_deref()
+        );
+    }
+
+    #[test]
+    fn worktree_repo_info_rejects_submodule_without_commondir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let sub_admin = tmp
+            .path()
+            .join("main-project")
+            .join(".git")
+            .join("modules")
+            .join("submod");
+        fs::create_dir_all(&sub_admin).expect("mkdir sub_admin");
+        // Note: NO commondir file written to sub_admin!
+
+        let sub_workdir = tmp.path().join("main-project").join("submod");
+        fs::create_dir_all(&sub_workdir).expect("mkdir sub_workdir");
+        fs::write(
+            sub_workdir.join(".git"),
+            format!("gitdir: {}\n", sub_admin.display()),
+        )
+        .expect("write .git file");
+
+        let info = worktree_repo_project(sub_workdir.to_str().expect("utf8"));
+        assert_eq!(info, None);
+    }
+
+    #[test]
+    fn worktree_repo_info_resolves_sibling_worktree_fallback() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo_dir = tmp.path().join("my-backend");
+        fs::create_dir_all(repo_dir.join(".git")).expect("mkdir repo .git");
+
+        let wt_path = tmp.path().join("my-backend.wt-hotfix");
+        // wt_path does not even have to exist on disk (deleted worktree)
+        let info = worktree_repo_project(wt_path.to_str().expect("utf8"));
+        assert!(info.is_some());
+        let info = info.unwrap();
+        assert_eq!(info.repo_project, "my-backend");
+        assert_eq!(
+            info.git_root.as_deref(),
+            Some(repo_dir.to_str().expect("utf8"))
+        );
+        assert_eq!(
+            info.git_common_dir.as_deref(),
+            Some(repo_dir.join(".git").to_str().expect("utf8"))
+        );
+
+        let git = git_metadata_for_cwd(wt_path.to_str().expect("utf8"));
+        assert_eq!(git.repo_project.as_deref(), Some("my-backend"));
+        assert_eq!(git.status, "path-fallback");
+    }
+
+    #[test]
+    fn worktree_repo_info_rejects_sibling_without_surviving_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let wt_path = tmp.path().join("missing-backend.wt-hotfix");
+        let info = worktree_repo_project(wt_path.to_str().expect("utf8"));
+        assert_eq!(info, None);
+    }
+
+    #[test]
+    fn opencode_cwd_resolution_from_database() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("opencode.db");
+        let conn = Connection::open(&db_path).expect("open db");
+        conn.execute_batch(
+            "CREATE TABLE project (id TEXT PRIMARY KEY, worktree TEXT, name TEXT);
+             CREATE TABLE session (id TEXT PRIMARY KEY, project_id TEXT, parent_id TEXT, directory TEXT, title TEXT, time_created INTEGER);
+             INSERT INTO project (id, worktree, name) VALUES ('p1', '/repo/project-wt', 'project-name');
+             INSERT INTO session (id, project_id, parent_id, directory, title, time_created)
+                 VALUES ('s-dir', 'p1', NULL, '/repo/session-dir', 'Session Dir', 1000);
+             INSERT INTO session (id, project_id, parent_id, directory, title, time_created)
+                 VALUES ('s-wt', 'p1', NULL, NULL, 'Session WT', 2000);
+             INSERT INTO session (id, project_id, parent_id, directory, title, time_created)
+                 VALUES ('s-none', NULL, NULL, NULL, 'Session None', 3000);",
+        )
+        .expect("setup db");
+
+        let mut cache = OpencodeLookupCache::default();
+        let db_str = db_path.to_str().expect("utf8");
+
+        assert_eq!(
+            resolve_session_cwd_from_parts(SourceKind::Opencode, db_str, "s-dir", &mut cache)
+                .as_deref(),
+            Some("/repo/session-dir")
+        );
+        assert_eq!(
+            resolve_session_cwd_from_parts(SourceKind::Opencode, db_str, "s-wt", &mut cache)
+                .as_deref(),
+            Some("/repo/project-wt")
+        );
+        assert_eq!(
+            resolve_session_cwd_from_parts(SourceKind::Opencode, db_str, "s-none", &mut cache)
+                .as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn omp_and_cursor_cwd_resolution() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cache = OpencodeLookupCache::default();
+
+        // OMP session with "id" and "cwd"
+        let omp_file = tmp.path().join("omp_session.jsonl");
+        fs::write(
+            &omp_file,
+            "{\"type\":\"session\",\"version\":3,\"id\":\"omp-123\",\"cwd\":\"/repo/omp-app\"}\n",
+        )
+        .expect("write omp");
+        let omp_cwd = resolve_session_cwd_from_parts(
+            SourceKind::Omp,
+            omp_file.to_str().expect("utf8"),
+            "omp-123",
+            &mut cache,
+        );
+        assert_eq!(omp_cwd.as_deref(), Some("/repo/omp-app"));
+
+        // Cursor session with existing directory
+        let cursor_dir = tmp.path().join("cursor-repo");
+        fs::create_dir_all(&cursor_dir).expect("mkdir cursor repo");
+        let cursor_file = tmp.path().join("cursor_session.json");
+        fs::write(
+            &cursor_file,
+            format!("{{\"cwd\":\"{}\"}}\n", cursor_dir.display()),
+        )
+        .expect("write cursor");
+        let cursor_cwd = resolve_session_cwd_from_parts(
+            SourceKind::Cursor,
+            cursor_file.to_str().expect("utf8"),
+            "cursor-123",
+            &mut cache,
+        );
+        assert_eq!(
+            cursor_cwd.as_deref(),
+            Some(cursor_dir.to_str().expect("utf8"))
+        );
     }
 }

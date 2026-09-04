@@ -477,6 +477,7 @@ fn activity_matching_session_scopes(
         .session_scopes_matching_query(&QueryOptions {
             query: params.query.clone(),
             project: params.project.clone(),
+            projects: None,
             role: None,
             tool: None,
             session_id: None,
@@ -1263,6 +1264,7 @@ fn search_payload(paths: &Paths, params: &SearchRequest) -> Result<SearchPayload
     let query_options = |limit| QueryOptions {
         query: params.query.clone(),
         project: params.project.clone(),
+        projects: None,
         role: None,
         tool: None,
         session_id: None,

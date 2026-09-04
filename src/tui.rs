@@ -5200,6 +5200,7 @@ fn sessions_from_query(
     let options = QueryOptions {
         query: query.to_string(),
         project: project.map(|s| s.to_string()),
+        projects: None,
         role: None,
         tool: None,
         session_id: None,
@@ -5644,11 +5645,7 @@ fn run_search_request(
                 false,
             )?
         } else {
-            let tantivy_project = if request.grouping == ProjectGrouping::Flat {
-                project.map(str::to_string)
-            } else {
-                None
-            };
+            let tantivy_project = project.map(str::to_string);
             federated_search(
                 paths,
                 config,

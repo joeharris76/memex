@@ -1593,7 +1593,7 @@ fn cwd_from_pi_session(path: &Path) -> Option<PathBuf> {
     None
 }
 
-fn cwd_from_cursor_session(path: &Path) -> Option<PathBuf> {
+pub(crate) fn cwd_from_cursor_session(path: &Path) -> Option<PathBuf> {
     cwd_from_cursor_transcript(path).or_else(|| cwd_from_cursor_project_path(path))
 }
 

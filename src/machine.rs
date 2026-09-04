@@ -72,6 +72,7 @@ impl SearchSpec {
         QueryOptions {
             query: self.query.clone(),
             project: self.project.clone(),
+            projects: None,
             role: self.role.clone(),
             tool: self.tool.clone(),
             session_id: self.session_id.clone(),
@@ -2337,6 +2338,19 @@ fn search_local(
     }
     let index = SearchIndex::open_or_create(&paths.index)?;
     let mut options = spec.query_options();
+    if let Some(project) = spec.project.as_deref()
+        && spec.project_grouping != Some(ProjectGrouping::Flat)
+    {
+        let db = crate::analytics::analytics_path(&paths.state);
+        if db.exists()
+            && let Ok(store) = AnalyticsStore::open_read_only(&db)
+            && let Ok(matching) = store.raw_projects_for_repository(project)
+            && !matching.is_empty()
+        {
+            options.projects = Some(matching);
+            options.project = None;
+        }
+    }
     if let Some(cwd) = spec.cwd.as_deref() {
         options.session_scope = Some(session_scope_for_cwd(paths, cwd)?);
     }
@@ -2790,9 +2804,13 @@ fn validate_machine(machine: &MachineConfig) -> Result<()> {
 
 fn matches_filters(record: &Record, options: &QueryOptions) -> bool {
     options
-        .project
+        .projects
         .as_ref()
-        .is_none_or(|project| record.project == *project)
+        .is_none_or(|projects| projects.contains(&record.project))
+        && options
+            .project
+            .as_ref()
+            .is_none_or(|project| record.project == *project)
         && options
             .role
             .as_ref()
@@ -3819,5 +3837,52 @@ mod tests {
         assert_eq!(merged.total_tokens, 30);
         assert_eq!(merged.by_source[0].source, "local/codex");
         assert_eq!(merged.by_source[1].source, "mini/claude");
+    }
+
+    #[test]
+    fn search_local_expands_repository_project_to_worktrees() {
+        let tmp = TempDir::new().unwrap();
+        let paths = Paths::new(Some(tmp.path().join("memex"))).unwrap();
+        paths.ensure_dirs().unwrap();
+
+        let repo_dir = tmp.path().join("my-repo");
+        std::fs::create_dir_all(repo_dir.join(".git")).unwrap();
+        let wt_path = tmp.path().join("my-repo.wt-feature");
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(
+            &transcript,
+            format!("{{\"cwd\":\"{}\"}}\n", wt_path.display()),
+        )
+        .unwrap();
+
+        let mut rec1 = test_record(1, "s1", &transcript.to_string_lossy(), 1);
+        rec1.project = "my-repo.wt-feature".to_string();
+        rec1.text = "search_target_text".to_string();
+
+        let mut rec2 = test_record(2, "s2", "other.jsonl", 1);
+        rec2.project = "other-repo".to_string();
+        rec2.text = "search_target_text".to_string();
+
+        write_test_index(&paths, &[rec1.clone(), rec2]);
+
+        let mut writer = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
+        writer.record(&rec1).unwrap();
+        writer.flush().unwrap();
+
+        // Repository grouping (default) expands "my-repo" to ["my-repo.wt-feature"]
+        let mut spec = search_spec(SearchMode::Lexical);
+        spec.query = "search_target_text".to_string();
+        spec.project = Some("my-repo".to_string());
+
+        let config = UserConfig::default();
+        let results = search_local(&paths, &config, &spec, false).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].1.doc_id, 1);
+
+        // Flat grouping does not expand
+        let mut flat_spec = spec.clone();
+        flat_spec.project_grouping = Some(ProjectGrouping::Flat);
+        let flat_results = search_local(&paths, &config, &flat_spec, false).unwrap();
+        assert_eq!(flat_results.len(), 0);
     }
 }

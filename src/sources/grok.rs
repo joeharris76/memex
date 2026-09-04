@@ -13,7 +13,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 1,
+    // Bumped for summary `session_kind` subagent classification: forces a
+    // full re-parse so worker sessions reclassify on next index.
+    index: 2,
     usage: 1,
 };
 
@@ -74,10 +76,30 @@ struct GrokSummary {
     cwd: Option<String>,
     project: Option<String>,
     title: Option<String>,
+    session_kind: Option<String>,
 }
 
 pub fn session_title(updates_path: &Path) -> Option<String> {
     read_summary(updates_path).title
+}
+
+/// Raw `session_kind` from the session's `summary.json` sidecar, if any
+/// (e.g. `"subagent"`, `"subagent_resume"`, `"headless"`).
+pub fn session_kind(updates_path: &Path) -> Option<String> {
+    read_summary(updates_path).session_kind
+}
+
+/// Subagent-family kind to store, if the summary names one. Only the
+/// `subagent*` values count: `headless`/`worktree` sessions can still be
+/// the user's own foreground work, so they stay interactive.
+pub(crate) fn grok_subagent_kind(session_kind: Option<&str>) -> Option<String> {
+    let kind = session_kind
+        .map(str::trim)
+        .filter(|kind| !kind.is_empty())?;
+    if kind == "main" || !kind.starts_with("subagent") {
+        return None;
+    }
+    Some(kind.to_string())
 }
 
 fn read_summary(updates_path: &Path) -> GrokSummary {
@@ -116,6 +138,12 @@ fn read_summary(updates_path: &Path) -> GrokSummary {
         .and_then(Value::as_str)
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string);
+    let session_kind = value
+        .get("session_kind")
+        .or_else(|| value.pointer("/info/session_kind"))
+        .and_then(Value::as_str)
+        .filter(|kind| !kind.trim().is_empty())
+        .map(str::to_string);
     GrokSummary {
         session_id: value
             .pointer("/info/id")
@@ -124,6 +152,7 @@ fn read_summary(updates_path: &Path) -> GrokSummary {
         cwd,
         project,
         title,
+        session_kind,
     }
 }
 
@@ -200,9 +229,13 @@ pub(crate) fn parse_index_records(
             .and_then(Value::as_str)
             .map(str::to_string)
             .or_else(|| Some(format!("{session_id}:{turn_id}")));
+        // Worker sessions self-mark via the summary sidecar; the stored
+        // bucket is what the origin filter matches on.
+        let conversation_kind = grok_subagent_kind(summary.session_kind.as_deref())
+            .unwrap_or_else(|| "main".to_string());
         let base_links = RecordLinks {
             event_id,
-            conversation_kind: Some("main".to_string()),
+            conversation_kind: Some(conversation_kind),
             ..RecordLinks::default()
         };
 
@@ -370,8 +403,10 @@ pub(crate) fn parse_index_records(
                 })?;
                 turn_id += 1;
             }
+            // Parent-side worker lifecycle metadata, not conversation: the
+            // child session's own file carries its records and kind.
             "hook_execution" | "plan" | "retry_state" | "task_backgrounded" | "task_completed"
-            | "turn_completed" => {}
+            | "turn_completed" | "subagent_spawned" | "subagent_finished" => {}
             "" => diagnostics.increment_unknown_semantic("missing_session_update"),
             unknown => diagnostics.increment_unknown_semantic(unknown),
         }
@@ -730,5 +765,102 @@ mod tests {
             session_title(&session.join("updates.jsonl")).as_deref(),
             Some("My Grok Project")
         );
+    }
+
+    fn parse_one_user_chunk(summary_json: &str) -> Vec<Record> {
+        let temp = TempDir::new().unwrap();
+        let session = temp.path().join("encoded-cwd").join("session-id");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(session.join("summary.json"), summary_json).unwrap();
+        fs::write(
+            session.join("updates.jsonl"),
+            "{\"timestamp\":1700000000,\"params\":{\"sessionId\":\"session-id\",\
+             \"update\":{\"sessionUpdate\":\"user_message_chunk\",\
+             \"content\":{\"type\":\"text\",\"text\":\"hello\"}},\
+             \"_meta\":{\"eventId\":\"user-1\",\"agentTimestampMs\":1700000000001}}}\n",
+        )
+        .unwrap();
+        let mut records = Vec::new();
+        parse_index_records(
+            &session.join("updates.jsonl"),
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+        records
+    }
+
+    #[test]
+    fn subagent_summary_marks_records_as_subagent() {
+        let records = parse_one_user_chunk(
+            r#"{"session_kind":"subagent","info":{"id":"session-id","cwd":"/work/repo"}}"#,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent")
+        );
+    }
+
+    #[test]
+    fn subagent_resume_kind_is_preserved_raw() {
+        let records = parse_one_user_chunk(
+            r#"{"session_kind":"subagent_resume","info":{"id":"session-id","cwd":"/work/repo"}}"#,
+        );
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent_resume")
+        );
+    }
+
+    #[test]
+    fn missing_and_headless_kinds_stay_main() {
+        let records = parse_one_user_chunk(r#"{"info":{"id":"session-id","cwd":"/work/repo"}}"#);
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+        // Headless foreground runs are still the user's own work.
+        let records = parse_one_user_chunk(
+            r#"{"session_kind":"headless","info":{"id":"session-id","cwd":"/work/repo"}}"#,
+        );
+        assert_eq!(records[0].links.conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn subagent_lifecycle_updates_emit_no_records_or_diagnostics() {
+        let temp = TempDir::new().unwrap();
+        let session = temp.path().join("encoded-cwd").join("session-id");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("summary.json"),
+            r#"{"info":{"id":"session-id","cwd":"/work/repo"}}"#,
+        )
+        .unwrap();
+        let lines = [
+            r#"{"timestamp":1700000000,"params":{"sessionId":"session-id","update":{"sessionUpdate":"subagent_spawned","subagent_id":"child-1","child_session_id":"child-1","subagent_type":"explore"},"_meta":{"eventId":"spawn-1"}}}"#,
+            r#"{"timestamp":1700000001,"params":{"sessionId":"session-id","update":{"sessionUpdate":"subagent_finished","subagent_id":"child-1","child_session_id":"child-1","status":"completed"},"_meta":{"eventId":"finish-1"}}}"#,
+        ];
+        fs::write(session.join("updates.jsonl"), lines.join("\n") + "\n").unwrap();
+
+        let mut records = Vec::new();
+        let parsed = parse_index_records(
+            &session.join("updates.jsonl"),
+            IndexParseState::default(),
+            false,
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert!(records.is_empty());
+        assert!(parsed.diagnostics.unknown_semantic_types.is_empty());
+        assert_eq!(parsed.diagnostics.malformed_json_lines, 0);
     }
 }
