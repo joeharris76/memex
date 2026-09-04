@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
@@ -237,8 +237,8 @@ impl AnalyticsStore {
                  label LIKE 'You are a reminder observer%'",
                 [],
             );
-            if previous_schema_version.unwrap_or(0) < 8 {
-                let _ = self.migrate_v8_repo_projects();
+            if previous_schema_version.unwrap_or(0) < 9 {
+                let _ = self.migrate_v9_repo_projects();
             }
         }
         self.conn.execute(
@@ -249,7 +249,7 @@ impl AnalyticsStore {
         Ok(())
     }
 
-    fn migrate_v8_repo_projects(&self) -> Result<()> {
+    fn migrate_v9_repo_projects(&self) -> Result<()> {
         let mut stmt = self.conn.prepare(
             "SELECT source, session_id, source_path, project, cwd FROM sessions
              WHERE repo_project IS NULL OR repo_project = '' OR repo_project = '.codex'",
@@ -268,34 +268,41 @@ impl AnalyticsStore {
             .collect();
         drop(stmt);
 
-        let mut update = self.conn.prepare(
-            "UPDATE sessions SET repo_project = ?1, git_root = COALESCE(git_root, ?2), git_common_dir = COALESCE(git_common_dir, ?3), cwd = COALESCE(cwd, ?4)
-             WHERE source = ?5 AND session_id = ?6 AND source_path = ?7",
-        )?;
-        for (source_str, session_id, source_path, _project, cwd) in rows {
-            let source = SourceKind::from_label(&source_str);
-            let resolved_cwd = cwd.or_else(|| {
-                if source == Some(SourceKind::Claude) {
-                    claude_cwd_from_source_path(&source_path)
-                } else {
-                    None
-                }
-            });
-            if let Some(ref c) = resolved_cwd {
-                let git = git_metadata_for_cwd(c);
-                if let Some(repo_project) = git.repo_project {
-                    let _ = update.execute(params![
-                        repo_project,
-                        git.git_root,
-                        git.git_common_dir,
-                        resolved_cwd,
-                        source_str,
-                        session_id,
-                        source_path,
-                    ]);
+        let mut git_cache: HashMap<String, GitMetadata> = HashMap::new();
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut update = tx.prepare(
+                "UPDATE sessions SET repo_project = ?1, git_root = COALESCE(git_root, ?2), git_common_dir = COALESCE(git_common_dir, ?3), cwd = COALESCE(cwd, ?4)
+                 WHERE source = ?5 AND session_id = ?6 AND source_path = ?7",
+            )?;
+            for (source_str, session_id, source_path, _project, cwd) in rows {
+                let source = SourceKind::from_label(&source_str);
+                let resolved_cwd = cwd.or_else(|| {
+                    if source == Some(SourceKind::Claude) {
+                        claude_cwd_from_source_path(&source_path)
+                    } else {
+                        None
+                    }
+                });
+                if let Some(ref c) = resolved_cwd {
+                    let git = git_cache
+                        .entry(c.clone())
+                        .or_insert_with(|| git_metadata_for_cwd(c));
+                    if let Some(ref repo_project) = git.repo_project {
+                        let _ = update.execute(params![
+                            repo_project,
+                            git.git_root,
+                            git.git_common_dir,
+                            resolved_cwd,
+                            source_str,
+                            session_id,
+                            source_path,
+                        ]);
+                    }
                 }
             }
         }
+        tx.commit()?;
         Ok(())
     }
 
@@ -4114,7 +4121,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_8_migration_recomputes_repo_project() {
+    fn schema_9_migration_recomputes_repo_project() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let db_path = tmp.path().join("analytics.sqlite");
         let dev_dir = tmp.path().join("Developer");
@@ -4158,7 +4165,7 @@ mod tests {
             .expect("insert session");
         }
 
-        // Opening store triggers upgrade to schema 8 and runs migrate_v8_repo_projects
+        // Opening store triggers upgrade to schema 9 and runs migrate_v9_repo_projects
         let store = AnalyticsStore::open(&db_path).expect("open and migrate");
         let repo_proj: Option<String> = store
             .conn
