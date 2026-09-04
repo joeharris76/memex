@@ -19,7 +19,9 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, MmapDirectory, WatchCallback, WatchHandle, WritePtr,
 };
 use tantivy::merge_policy::NoMergePolicy;
-use tantivy::query::{AllQuery, BooleanQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery};
+use tantivy::query::{
+    AllQuery, BooleanQuery, BoostQuery, EmptyQuery, Occur, Query, RangeQuery, TermQuery,
+};
 use tantivy::schema::Value;
 use tantivy::schema::{
     FAST, Field, INDEXED, IndexRecordOption, STORED, STRING, Schema, SchemaBuilder, TEXT,
@@ -2348,25 +2350,26 @@ fn build_query(
     }
 
     if let Some(projects) = &options.projects {
-        let project_clauses: Vec<(Occur, Box<dyn Query>)> = projects
-            .iter()
-            .map(|p| {
-                let term = Term::from_field_text(fields.project, p);
-                (
-                    Occur::Should,
-                    Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
-                )
-            })
-            .collect();
-        if !project_clauses.is_empty() {
-            clauses.push((Occur::Must, Box::new(BooleanQuery::new(project_clauses))));
+        if projects.is_empty() {
+            clauses.push((Occur::Must, Box::new(EmptyQuery)));
+        } else {
+            let project_clauses: Vec<(Occur, Box<dyn Query>)> = projects
+                .iter()
+                .map(|p| {
+                    let term = Term::from_field_text(fields.project, p);
+                    (
+                        Occur::Should,
+                        Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>,
+                    )
+                })
+                .collect();
+            let bq = Box::new(BooleanQuery::new(project_clauses));
+            clauses.push((Occur::Must, Box::new(BoostQuery::new(bq, 0.0))));
         }
     } else if let Some(project) = &options.project {
         let term = Term::from_field_text(fields.project, project);
-        clauses.push((
-            Occur::Must,
-            Box::new(TermQuery::new(term, IndexRecordOption::Basic)),
-        ));
+        let tq = Box::new(TermQuery::new(term, IndexRecordOption::Basic));
+        clauses.push((Occur::Must, Box::new(BoostQuery::new(tq, 0.0))));
     }
 
     if let Some(role) = &options.role {
@@ -3088,6 +3091,28 @@ mod tests {
     }
 
     #[test]
+    fn projects_empty_list_matches_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let index = SearchIndex::open_or_create(tmp.path()).expect("index");
+        let mut first = test_record(1, "findme");
+        first.project = "repo-main".to_string();
+
+        let mut writer = index.writer().expect("writer");
+        index.add_record(&mut writer, &first).expect("first");
+        writer.commit().expect("commit");
+
+        let matched = index
+            .search(&QueryOptions {
+                query: "findme".to_string(),
+                projects: Some(vec![]),
+                limit: 10,
+                ..Default::default()
+            })
+            .expect("search");
+        assert_eq!(matched.len(), 0);
+    }
+
+    #[test]
     fn ingest_open_recreates_stale_schema_index() {
         let tmp = tempfile::tempdir().expect("tempdir");
         create_stale_schema_index(tmp.path());
@@ -3497,8 +3522,8 @@ mod tests {
                 until: None,
                 limit: 10,
             })
-            .map(|r| r.len())
-            .unwrap_or(0)
+            .expect("search")
+            .len()
     }
 
     #[cfg(unix)]

@@ -2345,9 +2345,12 @@ fn search_local(
         if db.exists()
             && let Ok(store) = AnalyticsStore::open_read_only(&db)
             && let Ok(matching) = store.raw_projects_for_repository(project)
-            && !matching.is_empty()
         {
-            options.projects = Some(matching);
+            let mut all_projects = matching;
+            if !all_projects.iter().any(|p| p == project) {
+                all_projects.push(project.to_string());
+            }
+            options.projects = Some(all_projects);
             options.project = None;
         }
     }
@@ -2803,14 +2806,15 @@ fn validate_machine(machine: &MachineConfig) -> Result<()> {
 }
 
 fn matches_filters(record: &Record, options: &QueryOptions) -> bool {
-    options
-        .projects
-        .as_ref()
-        .is_none_or(|projects| projects.contains(&record.project))
-        && options
-            .project
-            .as_ref()
-            .is_none_or(|project| record.project == *project)
+    let project_matches = if let Some(projects) = options.projects.as_ref() {
+        projects.contains(&record.project)
+    } else if let Some(project) = options.project.as_ref() {
+        record.project == *project
+    } else {
+        true
+    };
+
+    project_matches
         && options
             .role
             .as_ref()
@@ -3863,26 +3867,33 @@ mod tests {
         rec2.project = "other-repo".to_string();
         rec2.text = "search_target_text".to_string();
 
-        write_test_index(&paths, &[rec1.clone(), rec2]);
+        let mut rec3 = test_record(3, "s3", "main.jsonl", 1);
+        rec3.project = "my-repo".to_string();
+        rec3.text = "search_target_text".to_string();
+
+        write_test_index(&paths, &[rec1.clone(), rec2, rec3]);
 
         let mut writer = AnalyticsWriter::open(analytics_path(&paths.state)).unwrap();
         writer.record(&rec1).unwrap();
         writer.flush().unwrap();
 
-        // Repository grouping (default) expands "my-repo" to ["my-repo.wt-feature"]
+        // Repository grouping (default) expands "my-repo" to ["my-repo", "my-repo.wt-feature"]
         let mut spec = search_spec(SearchMode::Lexical);
         spec.query = "search_target_text".to_string();
         spec.project = Some("my-repo".to_string());
 
         let config = UserConfig::default();
         let results = search_local(&paths, &config, &spec, false).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].1.doc_id, 1);
+        assert_eq!(results.len(), 2);
+        let doc_ids: Vec<u64> = results.iter().map(|(_, r)| r.doc_id).collect();
+        assert!(doc_ids.contains(&1));
+        assert!(doc_ids.contains(&3));
 
-        // Flat grouping does not expand
+        // Flat grouping does not expand, matching only the exact "my-repo" project
         let mut flat_spec = spec.clone();
         flat_spec.project_grouping = Some(ProjectGrouping::Flat);
         let flat_results = search_local(&paths, &config, &flat_spec, false).unwrap();
-        assert_eq!(flat_results.len(), 0);
+        assert_eq!(flat_results.len(), 1);
+        assert_eq!(flat_results[0].1.doc_id, 3);
     }
 }

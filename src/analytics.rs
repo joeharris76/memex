@@ -873,12 +873,15 @@ impl AnalyticsStore {
     pub fn raw_projects_for_repository(&self, repo: &str) -> Result<Vec<String>> {
         let mut stmt = self.conn.prepare(
             "SELECT DISTINCT project FROM sessions
-             WHERE COALESCE(NULLIF(repo_project, ''), project) = ?1",
+             WHERE (repo_project = ?1 OR (repo_project IS NULL AND project = ?1))
+               AND project IS NOT NULL AND project != ''",
         )?;
-        let rows = stmt.query_map([repo], |row| row.get(0))?;
+        let rows = stmt.query_map([repo], |row| row.get::<_, Option<String>>(0))?;
         let mut out = Vec::new();
         for row in rows {
-            out.push(row?);
+            if let Some(proj) = row?.filter(|s| !s.is_empty()) {
+                out.push(proj);
+            }
         }
         Ok(out)
     }
@@ -1221,40 +1224,16 @@ pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
 fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
     let path = Path::new(cwd);
 
-    // 1. Ancestor worktree paths (.claude/worktrees/*, .worktrees/*, or worktrees/*)
-    for ancestor in path.ancestors() {
-        let name = ancestor.file_name().and_then(|n| n.to_str());
-        if name == Some("worktrees") || name == Some(".worktrees") {
-            let parent = ancestor.parent()?;
-            let repo_dir = if parent.file_name().and_then(|n| n.to_str()) == Some(".claude") {
-                parent.parent()?
-            } else {
-                parent
-            };
-            let repo_name = path_file_name(repo_dir.to_string_lossy().as_ref())?;
-            let git_root = repo_dir.to_string_lossy().to_string();
-            let common_dir = repo_dir.join(".git");
-            let git_common_dir = if common_dir.exists() {
-                Some(common_dir.to_string_lossy().to_string())
-            } else {
-                Some(git_root.clone())
-            };
-            return Some(WorktreeRepoInfo {
-                repo_project: repo_name,
-                git_root: Some(git_root),
-                git_common_dir,
-            });
-        }
-    }
-
-    // 2. Direct .git file check (when worktree directory exists on disk)
+    // 1. Direct .git file check (authoritative when worktree directory exists on disk)
     // Submodule protection: worktree gitdirs have a "commondir" file pointing to the main repo's git dir.
     let git_file = path.join(".git");
     if git_file.is_file()
         && let Ok(content) = std::fs::read_to_string(&git_file)
-        && let Some(line) = content.lines().find(|l| l.starts_with("gitdir:"))
+        && let Some(line) = content
+            .lines()
+            .find(|l| l.trim_start().starts_with("gitdir:"))
     {
-        let gitdir_str = line["gitdir:".len()..].trim();
+        let gitdir_str = line.trim_start()["gitdir:".len()..].trim();
         let gitdir_path = path.join(gitdir_str);
         let commondir_file = gitdir_path.join("commondir");
         if commondir_file.is_file()
@@ -1270,7 +1249,9 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
                             .parent()
                             .map(|p| p.to_string_lossy().to_string())
                     } else {
-                        Some(canonical_common.to_string_lossy().to_string())
+                        canonical_common
+                            .parent()
+                            .map(|p| p.to_string_lossy().to_string())
                     };
                 return Some(WorktreeRepoInfo {
                     repo_project,
@@ -1279,27 +1260,71 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
                 });
             }
         }
+        // Has a .git file pointing to gitdir, but lacks commondir: this is a submodule, not a worktree.
+        // Do not fall through to name heuristics.
+        return None;
+    }
+
+    // 2. Ancestor worktree paths (.claude/worktrees/*, .worktrees/*, or worktrees/*)
+    for ancestor in path.ancestors() {
+        let name = ancestor.file_name().and_then(|n| n.to_str());
+        if name == Some("worktrees") || name == Some(".worktrees") {
+            let Some(parent) = ancestor.parent() else {
+                continue;
+            };
+            if parent.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                continue;
+            }
+            let is_claude = parent.file_name().and_then(|n| n.to_str()) == Some(".claude");
+            let repo_dir = if is_claude {
+                let Some(p) = parent.parent() else {
+                    continue;
+                };
+                p
+            } else {
+                parent
+            };
+            let common_dir = repo_dir.join(".git");
+            if !is_claude && !common_dir.exists() && !repo_dir.join("HEAD").exists() {
+                continue;
+            }
+            let Some(repo_name) = path_file_name(repo_dir.to_string_lossy().as_ref()) else {
+                continue;
+            };
+            let git_root = repo_dir.to_string_lossy().to_string();
+            let git_common_dir = if common_dir.exists() {
+                Some(common_dir.to_string_lossy().to_string())
+            } else {
+                Some(git_root.clone())
+            };
+            return Some(WorktreeRepoInfo {
+                repo_project: repo_name,
+                git_root: Some(git_root),
+                git_common_dir,
+            });
+        }
     }
 
     // 3. Sibling worktree naming convention (handles deleted worktrees)
-    // Common delimiters: .wt-, -wt-, .wt/, .worktree-, -worktree-
+    // Common delimiters: .wt-, -wt-, .worktree-, -worktree-
     let leaf = path.file_name().and_then(|n| n.to_str())?;
-    for delimiter in [".wt-", ".wt/", "-wt-", ".worktree-", "-worktree-"] {
-        if let Some((repo_prefix, _)) = leaf.split_once(delimiter)
+    for delimiter in [".wt-", "-wt-", ".worktree-", "-worktree-"] {
+        if let Some((repo_prefix, _)) = leaf.rsplit_once(delimiter)
             && !repo_prefix.is_empty()
             && let Some(parent) = path.parent()
         {
             let candidate = parent.join(repo_prefix);
             let candidate_git = candidate.join(".git");
-            if candidate_git.exists() || candidate.is_dir() {
+            if candidate_git.exists() {
                 let git_root = candidate.to_string_lossy().to_string();
-                let git_common_dir = if candidate_git.exists() {
-                    candidate_git.to_string_lossy().to_string()
-                } else {
-                    git_root.clone()
-                };
+                let git_common_dir = candidate_git.to_string_lossy().to_string();
+                let actual_name = candidate
+                    .canonicalize()
+                    .ok()
+                    .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .unwrap_or_else(|| repo_prefix.to_string());
                 return Some(WorktreeRepoInfo {
-                    repo_project: repo_prefix.to_string(),
+                    repo_project: actual_name,
                     git_root: Some(git_root),
                     git_common_dir: Some(git_common_dir),
                 });
@@ -1533,11 +1558,19 @@ fn resolve_session_cwd_from_parts(
             fallback = cwd.clone();
         }
 
+        let id_val = if matches!(
+            source,
+            SourceKind::Pi | SourceKind::OpenClaw | SourceKind::Omp
+        ) {
+            value.get("id").and_then(|v| v.as_str())
+        } else {
+            None
+        };
         let session_id_match = value
             .get("sessionId")
             .and_then(|v| v.as_str())
             .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
-            .or_else(|| value.get("id").and_then(|v| v.as_str()))
+            .or(id_val)
             .map(|s| s == session_id)
             .unwrap_or(false);
 
@@ -1563,11 +1596,12 @@ fn resolve_session_cwd_from_parts(
             SourceKind::Pi | SourceKind::OpenClaw | SourceKind::Omp
         ) && value.get("type").and_then(|v| v.as_str()) == Some("session")
         {
-            let cwd = value
-                .get("cwd")
+            let id_matches = value
+                .get("id")
                 .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if cwd.is_some() {
+                .map(|s| s == session_id)
+                .unwrap_or(false);
+            if (id_matches || session_id_match) && cwd.is_some() {
                 return cwd;
             }
         }
@@ -2049,31 +2083,48 @@ fn opencode_cwd_for_session(db_path: &str, session_id: &str) -> Option<String> {
 /// collapses repeated reads of the same database and rows.
 #[derive(Default)]
 struct OpencodeLookupCache {
-    titles: HashMap<(String, String), Option<String>>,
+    titles: HashMap<(String, String), String>,
     parented: HashMap<(String, String), bool>,
-    cwds: HashMap<(String, String), Option<String>>,
+    cwds: HashMap<(String, String), String>,
 }
 
 impl OpencodeLookupCache {
     fn title(&mut self, db_path: &str, session_id: &str) -> Option<String> {
-        self.titles
-            .entry((db_path.to_string(), session_id.to_string()))
-            .or_insert_with(|| opencode_title_for_session(db_path, session_id))
-            .clone()
+        let key = (db_path.to_string(), session_id.to_string());
+        if let Some(cached) = self.titles.get(&key) {
+            return Some(cached.clone());
+        }
+        if let Some(title) = opencode_title_for_session(db_path, session_id) {
+            self.titles.insert(key, title.clone());
+            Some(title)
+        } else {
+            None
+        }
     }
 
     fn has_parent(&mut self, db_path: &str, session_id: &str) -> bool {
-        *self
-            .parented
-            .entry((db_path.to_string(), session_id.to_string()))
-            .or_insert_with(|| opencode_session_has_parent(db_path, session_id))
+        let key = (db_path.to_string(), session_id.to_string());
+        if let Some(&cached) = self.parented.get(&key) {
+            return cached;
+        }
+        let has = opencode_session_has_parent(db_path, session_id);
+        if has {
+            self.parented.insert(key, true);
+        }
+        has
     }
 
     fn cwd(&mut self, db_path: &str, session_id: &str) -> Option<String> {
-        self.cwds
-            .entry((db_path.to_string(), session_id.to_string()))
-            .or_insert_with(|| opencode_cwd_for_session(db_path, session_id))
-            .clone()
+        let key = (db_path.to_string(), session_id.to_string());
+        if let Some(cached) = self.cwds.get(&key) {
+            return Some(cached.clone());
+        }
+        if let Some(cwd) = opencode_cwd_for_session(db_path, session_id) {
+            self.cwds.insert(key, cwd.clone());
+            Some(cwd)
+        } else {
+            None
+        }
     }
 }
 
@@ -2264,16 +2315,31 @@ fn session_selection_sql(
         values.push(rusqlite::types::Value::Text(project.to_string()));
     }
     if let Some(cwd) = cwd {
-        let root = cwd.trim_end_matches('/').to_string();
+        let trimmed = cwd.trim_end_matches('/');
+        let root = if trimmed.is_empty() {
+            "/".to_string()
+        } else {
+            trimmed.to_string()
+        };
         // Escape LIKE wildcards so a path like /tmp/foo_bar doesn't also
         // match sessions under /tmp/fooXbar.
         let escaped = root
             .replace('\\', "\\\\")
             .replace('%', "\\%")
             .replace('_', "\\_");
-        clauses.push("(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ?)".to_string());
+        let prefix = if root == "/" {
+            "/%".to_string()
+        } else {
+            format!("{escaped}/%")
+        };
+        clauses.push(
+            "(cwd = ? OR cwd LIKE ? ESCAPE '\\' OR git_root = ? OR git_common_dir = ? OR git_common_dir = ? || '/.git')"
+                .to_string(),
+        );
         values.push(rusqlite::types::Value::Text(root.clone()));
-        values.push(rusqlite::types::Value::Text(format!("{escaped}/%")));
+        values.push(rusqlite::types::Value::Text(prefix));
+        values.push(rusqlite::types::Value::Text(root.clone()));
+        values.push(rusqlite::types::Value::Text(root.clone()));
         values.push(rusqlite::types::Value::Text(root));
     }
     if let Some(since_ms) = since_ms {
@@ -3684,6 +3750,42 @@ mod tests {
         assert_eq!(
             cursor_cwd.as_deref(),
             Some(cursor_dir.to_str().expect("utf8"))
+        );
+    }
+
+    #[test]
+    fn worktree_repo_info_rejects_non_git_sibling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plain_dir = tmp.path().join("plain-folder");
+        fs::create_dir_all(&plain_dir).expect("mkdir plain dir");
+        // No .git directory in plain_dir!
+
+        let wt_path = tmp.path().join("plain-folder-wt-2024");
+        let info = worktree_repo_project(wt_path.to_str().expect("utf8"));
+        assert_eq!(info, None);
+    }
+
+    #[test]
+    fn cursor_cwd_resolution_supports_deleted_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let mut cache = OpencodeLookupCache::default();
+        let non_existent_dir = tmp.path().join("deleted-repo.wt-hotfix");
+        let cursor_file = tmp.path().join("cursor_session.json");
+        fs::write(
+            &cursor_file,
+            format!("{{\"cwd\":\"{}\"}}\n", non_existent_dir.display()),
+        )
+        .expect("write cursor");
+
+        let cursor_cwd = resolve_session_cwd_from_parts(
+            SourceKind::Cursor,
+            cursor_file.to_str().expect("utf8"),
+            "cursor-deleted",
+            &mut cache,
+        );
+        assert_eq!(
+            cursor_cwd.as_deref(),
+            Some(non_existent_dir.to_str().expect("utf8"))
         );
     }
 }

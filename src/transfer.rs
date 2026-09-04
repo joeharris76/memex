@@ -1624,7 +1624,8 @@ fn cursor_cwd_from_metadata_object(obj: &serde_json::Map<String, Value>) -> Opti
         if let Some(path) = obj
             .get(key)
             .and_then(Value::as_str)
-            .and_then(existing_dir_from_absolute)
+            .map(PathBuf::from)
+            .filter(|p| p.is_absolute())
         {
             return Some(path);
         }
@@ -1670,11 +1671,6 @@ fn decode_cursor_project_parts(base: PathBuf, parts: &[&str]) -> Option<PathBuf>
         }
     }
     None
-}
-
-fn existing_dir_from_absolute(value: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(value);
-    (path.is_absolute() && path.is_dir()).then_some(path)
 }
 
 fn cwd_from_opencode_session(message_dir: &Path) -> Option<PathBuf> {
