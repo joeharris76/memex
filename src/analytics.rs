@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_LABEL_CHARS: usize = 150;
 pub const UNFILED_PROJECT: &str = "Unfiled";
@@ -237,12 +237,65 @@ impl AnalyticsStore {
                  label LIKE 'You are a reminder observer%'",
                 [],
             );
+            if previous_schema_version.unwrap_or(0) < 7 {
+                let _ = self.migrate_v7_repo_projects();
+            }
         }
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
              ON CONFLICT(key) DO UPDATE SET value = excluded.value",
             params![SCHEMA_VERSION.to_string()],
         )?;
+        Ok(())
+    }
+
+    fn migrate_v7_repo_projects(&self) -> Result<()> {
+        let mut stmt = self.conn.prepare(
+            "SELECT source, session_id, source_path, project, cwd FROM sessions
+             WHERE repo_project IS NULL OR repo_project = '' OR repo_project = '.codex'",
+        )?;
+        let rows: Vec<(String, String, String, String, Option<String>)> = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    row.get(3)?,
+                    row.get(4)?,
+                ))
+            })?
+            .filter_map(Result::ok)
+            .collect();
+        drop(stmt);
+
+        let mut update = self.conn.prepare(
+            "UPDATE sessions SET repo_project = ?1, git_root = COALESCE(git_root, ?2), git_common_dir = COALESCE(git_common_dir, ?3), cwd = COALESCE(cwd, ?4)
+             WHERE source = ?5 AND session_id = ?6 AND source_path = ?7",
+        )?;
+        for (source_str, session_id, source_path, _project, cwd) in rows {
+            let source = SourceKind::from_label(&source_str);
+            let resolved_cwd = cwd.or_else(|| {
+                if source == Some(SourceKind::Claude) {
+                    claude_cwd_from_source_path(&source_path)
+                } else {
+                    None
+                }
+            });
+            if let Some(ref c) = resolved_cwd {
+                let git = git_metadata_for_cwd(c);
+                if let Some(repo_project) = git.repo_project {
+                    let _ = update.execute(params![
+                        repo_project,
+                        git.git_root,
+                        git.git_common_dir,
+                        resolved_cwd,
+                        source_str,
+                        session_id,
+                        source_path,
+                    ]);
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1221,6 +1274,89 @@ pub(crate) fn repository_project_for_cwd(cwd: &str) -> Option<String> {
     git_metadata_for_cwd(cwd).repo_project
 }
 
+fn get_development_roots() -> Vec<PathBuf> {
+    let mut roots = Vec::new();
+    if let Ok(home) = std::env::var("HOME") {
+        let home_path = PathBuf::from(home);
+        for sub in [
+            "Developer",
+            "Development",
+            "Code",
+            "Projects",
+            "src",
+            "repos",
+            "workspace",
+            "workspaces",
+        ] {
+            let candidate = home_path.join(sub);
+            if candidate.is_dir() {
+                roots.push(candidate);
+            }
+        }
+        roots.push(home_path);
+    }
+    roots
+}
+
+fn decode_claude_encoded_path(name: &str) -> Option<PathBuf> {
+    let name = if let Some(idx) = name.find("-Users-") {
+        &name[idx + 1..]
+    } else if let Some(idx) = name.find("-home-") {
+        &name[idx + 1..]
+    } else {
+        name.strip_prefix('-')?
+    };
+    if !(name.starts_with("Users-") || name.starts_with("home-")) {
+        return None;
+    }
+    let parts: Vec<&str> = name.split('-').collect();
+    let root = if name.starts_with("Users-") {
+        PathBuf::from("/Users")
+    } else {
+        PathBuf::from("/home")
+    };
+    let mut curr = root;
+    let mut idx = 1;
+    while idx < parts.len() {
+        let mut found = false;
+        for end in (idx + 1..=parts.len()).rev() {
+            let segment = parts[idx..end].join("-");
+            let candidate = curr.join(&segment);
+            if candidate.is_dir() {
+                curr = candidate;
+                idx = end;
+                found = true;
+                break;
+            }
+        }
+        if !found {
+            break;
+        }
+    }
+    if curr.join(".git").exists() || curr.join("HEAD").exists() {
+        Some(curr)
+    } else {
+        None
+    }
+}
+
+fn claude_cwd_from_source_path(source_path: &str) -> Option<String> {
+    let path = Path::new(source_path);
+    let folder = path.parent()?.file_name()?.to_str()?;
+    if (folder.contains("-Users-") || folder.contains("-home-"))
+        && let Some(repo_dir) = decode_claude_encoded_path(folder)
+    {
+        return Some(repo_dir.to_string_lossy().to_string());
+    }
+    if let Some(rest) = folder.strip_prefix("-private-tmp-") {
+        return Some(format!("/private/tmp/{rest}"));
+    }
+    if let Some(rest) = folder.strip_prefix("-tmp-") {
+        return Some(format!("/tmp/{rest}"));
+    }
+    None
+}
+
 fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
     let path = Path::new(cwd);
 
@@ -1275,7 +1411,33 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
             if parent.file_name().and_then(|n| n.to_str()) == Some(".git") {
                 continue;
             }
-            let is_claude = parent.file_name().and_then(|n| n.to_str()) == Some(".claude");
+            let parent_name = parent.file_name().and_then(|n| n.to_str());
+            if parent_name == Some(".codex") || parent_name == Some(".grok") {
+                if let Some(leaf) = path.file_name().and_then(|n| n.to_str()) {
+                    for dev_root in get_development_roots() {
+                        let candidate = dev_root.join(leaf);
+                        let candidate_git = candidate.join(".git");
+                        if candidate_git.exists() {
+                            let git_root = candidate.to_string_lossy().to_string();
+                            let git_common_dir = candidate_git.to_string_lossy().to_string();
+                            let actual_name = candidate
+                                .canonicalize()
+                                .ok()
+                                .and_then(|p| {
+                                    p.file_name().map(|n| n.to_string_lossy().to_string())
+                                })
+                                .unwrap_or_else(|| leaf.to_string());
+                            return Some(WorktreeRepoInfo {
+                                repo_project: actual_name,
+                                git_root: Some(git_root),
+                                git_common_dir: Some(git_common_dir),
+                            });
+                        }
+                    }
+                }
+                continue;
+            }
+            let is_claude = parent_name == Some(".claude");
             let repo_dir = if is_claude {
                 let Some(p) = parent.parent() else {
                     continue;
@@ -1302,11 +1464,55 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
                 git_root: Some(git_root),
                 git_common_dir,
             });
+        } else if let Some(name_str) = name {
+            if let Some(repo_name) = name_str
+                .strip_suffix("-worktrees")
+                .or_else(|| name_str.strip_suffix(".worktrees"))
+            {
+                if let Some(parent) = ancestor.parent() {
+                    let candidate = parent.join(repo_name);
+                    let common_dir = candidate.join(".git");
+                    if common_dir.exists() || candidate.join("HEAD").exists() {
+                        let git_root = candidate.to_string_lossy().to_string();
+                        let git_common_dir = if common_dir.exists() {
+                            Some(common_dir.to_string_lossy().to_string())
+                        } else {
+                            Some(git_root.clone())
+                        };
+                        let actual_name = candidate
+                            .canonicalize()
+                            .ok()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                            .unwrap_or_else(|| repo_name.to_string());
+                        return Some(WorktreeRepoInfo {
+                            repo_project: actual_name,
+                            git_root: Some(git_root),
+                            git_common_dir,
+                        });
+                    }
+                }
+            } else if (name_str.contains("-Users-") || name_str.contains("-home-"))
+                && let Some(repo_dir) = decode_claude_encoded_path(name_str)
+                && let Some(repo_name) = path_file_name(repo_dir.to_string_lossy().as_ref())
+            {
+                let common_dir = repo_dir.join(".git");
+                let git_root = repo_dir.to_string_lossy().to_string();
+                let git_common_dir = if common_dir.exists() {
+                    Some(common_dir.to_string_lossy().to_string())
+                } else {
+                    Some(git_root.clone())
+                };
+                return Some(WorktreeRepoInfo {
+                    repo_project: repo_name,
+                    git_root: Some(git_root),
+                    git_common_dir,
+                });
+            }
         }
     }
 
     // 3. Sibling worktree naming convention (handles deleted worktrees)
-    // Common delimiters: .wt-, -wt-, .worktree-, -worktree-
+    // Common delimiters: .wt-, -wt-, .worktree-, -worktree-, or any dot prefix
     let leaf = path.file_name().and_then(|n| n.to_str())?;
     for delimiter in [".wt-", "-wt-", ".worktree-", "-worktree-"] {
         if let Some((repo_prefix, _)) = leaf.rsplit_once(delimiter)
@@ -1328,6 +1534,79 @@ fn worktree_repo_project(cwd: &str) -> Option<WorktreeRepoInfo> {
                     git_root: Some(git_root),
                     git_common_dir: Some(git_common_dir),
                 });
+            }
+        }
+    }
+
+    if let Some((repo_prefix, _)) = leaf.split_once('.')
+        && !repo_prefix.is_empty()
+        && let Some(parent) = path.parent()
+    {
+        let candidate = parent.join(repo_prefix);
+        let candidate_git = candidate.join(".git");
+        if candidate != path && candidate_git.exists() {
+            let git_root = candidate.to_string_lossy().to_string();
+            let git_common_dir = candidate_git.to_string_lossy().to_string();
+            let actual_name = candidate
+                .canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                .unwrap_or_else(|| repo_prefix.to_string());
+            return Some(WorktreeRepoInfo {
+                repo_project: actual_name,
+                git_root: Some(git_root),
+                git_common_dir: Some(git_common_dir),
+            });
+        }
+    }
+
+    // 4. Temporary/worker directory prefix check (handles agent workers under /tmp, /private/tmp, etc.)
+    let path_str = path.to_string_lossy();
+    if path_str.starts_with("/tmp")
+        || path_str.starts_with("/private/tmp")
+        || path_str.starts_with("/var/folders")
+        || path_str.starts_with("/private/var/folders")
+    {
+        let mut temp_component = None;
+        let components: Vec<_> = path.components().collect();
+        for (i, comp) in components.iter().enumerate() {
+            let s = comp.as_os_str().to_string_lossy();
+            if (s == "tmp" || s == "T") && i + 1 < components.len() {
+                temp_component = Some(components[i + 1].as_os_str().to_string_lossy().to_string());
+                break;
+            }
+        }
+        if let Some(comp) = temp_component {
+            let mut prefixes = Vec::new();
+            if let Some((p, _)) = comp.split_once('.') {
+                prefixes.push(p);
+            }
+            if let Some((p, _)) = comp.split_once('-') {
+                prefixes.push(p);
+            }
+            let dev_roots = get_development_roots();
+            for prefix in prefixes {
+                if prefix.is_empty() {
+                    continue;
+                }
+                for root in &dev_roots {
+                    let candidate = root.join(prefix);
+                    let candidate_git = candidate.join(".git");
+                    if candidate_git.exists() {
+                        let git_root = candidate.to_string_lossy().to_string();
+                        let git_common_dir = candidate_git.to_string_lossy().to_string();
+                        let actual_name = candidate
+                            .canonicalize()
+                            .ok()
+                            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                            .unwrap_or_else(|| prefix.to_string());
+                        return Some(WorktreeRepoInfo {
+                            repo_project: actual_name,
+                            git_root: Some(git_root),
+                            git_common_dir: Some(git_common_dir),
+                        });
+                    }
+                }
             }
         }
     }
@@ -1606,7 +1885,13 @@ fn resolve_session_cwd_from_parts(
             }
         }
     }
-    fallback
+    fallback.or_else(|| {
+        if source == SourceKind::Claude {
+            claude_cwd_from_source_path(source_path)
+        } else {
+            None
+        }
+    })
 }
 
 #[derive(Default)]
@@ -3787,5 +4072,102 @@ mod tests {
             cursor_cwd.as_deref(),
             Some(non_existent_dir.to_str().expect("utf8"))
         );
+    }
+
+    #[test]
+    fn worktree_repo_info_resolves_dot_delimited_sibling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("BenchBox");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir repo .git");
+
+        let wt_path = tmp.path().join("BenchBox.pool-01");
+        let info = worktree_repo_project(wt_path.to_str().expect("utf8"));
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().repo_project, "BenchBox");
+    }
+
+    #[test]
+    fn worktree_repo_info_resolves_container_worktree() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let repo = tmp.path().join("omnigent");
+        fs::create_dir_all(repo.join(".git")).expect("mkdir repo .git");
+
+        let wt_path = tmp
+            .path()
+            .join("omnigent-worktrees")
+            .join("muse-production");
+        let info = worktree_repo_project(wt_path.to_str().expect("utf8"));
+        assert!(info.is_some());
+        assert_eq!(info.unwrap().repo_project, "omnigent");
+    }
+
+    #[test]
+    fn claude_cwd_from_source_path_resolves_encoded_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let claude_projects = tmp.path().join(".claude").join("projects");
+        let session_file = claude_projects
+            .join("-Users-joe-Developer-BenchBox")
+            .join("sess-1.jsonl");
+
+        let cwd = claude_cwd_from_source_path(session_file.to_str().expect("utf8"));
+        assert_eq!(cwd.as_deref(), Some("/Users/joe/Developer/BenchBox"));
+    }
+
+    #[test]
+    fn schema_7_migration_recomputes_repo_project() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db_path = tmp.path().join("analytics.sqlite");
+        let dev_dir = tmp.path().join("Developer");
+        let repo_dir = dev_dir.join("MyCoolRepo");
+        fs::create_dir_all(repo_dir.join(".git")).expect("mkdir repo");
+
+        {
+            let conn = Connection::open(&db_path).expect("open sqlite");
+            conn.execute_batch(
+                r#"
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '6');
+                INSERT INTO meta(key, value) VALUES('analytics_complete', '1');
+                CREATE TABLE sessions (
+                    source TEXT NOT NULL,
+                    session_id TEXT NOT NULL,
+                    source_path TEXT NOT NULL,
+                    project TEXT NOT NULL,
+                    cwd TEXT,
+                    git_root TEXT,
+                    git_common_dir TEXT,
+                    repo_project TEXT,
+                    started_at INTEGER NOT NULL,
+                    last_at INTEGER NOT NULL,
+                    message_count INTEGER NOT NULL DEFAULT 0,
+                    resolution_status TEXT NOT NULL DEFAULT '',
+                    label TEXT,
+                    conversation_kind TEXT,
+                    PRIMARY KEY (source, session_id, source_path)
+                );
+                "#,
+            )
+            .expect("seed schema 6");
+
+            let wt_path = dev_dir.join("MyCoolRepo.pool-02");
+            conn.execute(
+                "INSERT INTO sessions (source, session_id, source_path, project, cwd, started_at, last_at)
+                 VALUES ('codex', 's-wt1', '/tmp/s.jsonl', 'MyCoolRepo.pool-02', ?1, 1000, 2000)",
+                params![wt_path.to_str().expect("utf8")],
+            )
+            .expect("insert session");
+        }
+
+        // Opening store triggers upgrade to schema 7 and runs migrate_v7_repo_projects
+        let store = AnalyticsStore::open(&db_path).expect("open and migrate");
+        let repo_proj: Option<String> = store
+            .conn
+            .query_row(
+                "SELECT repo_project FROM sessions WHERE session_id = 's-wt1'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("query migrated repo_project");
+        assert_eq!(repo_proj.as_deref(), Some("MyCoolRepo"));
     }
 }
