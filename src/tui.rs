@@ -129,6 +129,7 @@ struct DetailRequest {
     session: SessionSummary,
     mode: PreviewMode,
     query: String,
+    role: RoleChoice,
     show_tools: bool,
 }
 
@@ -139,6 +140,7 @@ struct SearchRequest {
     project: String,
     machines: Vec<String>,
     source: SourceChoice,
+    role: RoleChoice,
     since: Option<u64>,
     grouping: ProjectGrouping,
     kind: crate::analytics::SessionKindFilter,
@@ -399,7 +401,74 @@ enum HomeDropdown {
     Machine,
     Source,
     Kind,
+    Role,
     Project,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum RoleChoice {
+    #[default]
+    All,
+    User,
+    Assistant,
+    ToolUse,
+    ToolResult,
+    Reasoning,
+}
+
+impl RoleChoice {
+    const ALL: [Self; 6] = [
+        Self::All,
+        Self::User,
+        Self::Assistant,
+        Self::ToolUse,
+        Self::ToolResult,
+        Self::Reasoning,
+    ];
+
+    fn as_str(self) -> Option<&'static str> {
+        match self {
+            Self::All => None,
+            Self::User => Some("user"),
+            Self::Assistant => Some("assistant"),
+            Self::ToolUse => Some("tool_use"),
+            Self::ToolResult => Some("tool_result"),
+            Self::Reasoning => Some("reasoning"),
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::All => "all",
+            Self::User => "user",
+            Self::Assistant => "assistant",
+            Self::ToolUse => "tool_use",
+            Self::ToolResult => "tool_result",
+            Self::Reasoning => "reasoning",
+        }
+    }
+
+    fn cycle(self) -> Self {
+        match self {
+            Self::All => Self::User,
+            Self::User => Self::Assistant,
+            Self::Assistant => Self::ToolUse,
+            Self::ToolUse => Self::ToolResult,
+            Self::ToolResult => Self::Reasoning,
+            Self::Reasoning => Self::All,
+        }
+    }
+
+    fn from_str_loose(s: &str) -> Self {
+        match s.trim().to_lowercase().as_str() {
+            "user" => Self::User,
+            "assistant" => Self::Assistant,
+            "tool_use" | "tool-use" | "tool" | "tools" => Self::ToolUse,
+            "tool_result" | "tool-result" => Self::ToolResult,
+            "reasoning" => Self::Reasoning,
+            _ => Self::All,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -540,6 +609,7 @@ struct App {
     home_machines: Vec<String>,
     source: SourceChoice,
     session_kind: crate::analytics::SessionKindFilter,
+    role: RoleChoice,
     all_projects: Vec<String>,
     project_options: Vec<String>,
     project_selected: usize,
@@ -596,6 +666,7 @@ struct App {
     home_machine_area: Rect,
     home_source_area: Rect,
     home_kind_area: Rect,
+    home_role_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
     home_projects: Vec<String>,
@@ -619,6 +690,7 @@ struct App {
     last_detail_session: Option<String>,
     last_detail_query: Option<String>,
     last_detail_mode: PreviewMode,
+    last_detail_role: RoleChoice,
     last_detail_find: Option<String>,
     status: String,
     last_status_at: Option<Instant>,
@@ -892,8 +964,10 @@ pub fn run(
     update_rx: Option<std::sync::mpsc::Receiver<String>>,
     initial_query: Option<String>,
     initial_project: Option<String>,
+    initial_role: Option<String>,
 ) -> Result<()> {
     let paths = Paths::new(root)?;
+    let _ = AnalyticsStore::open(analytics_path(&paths.state));
     let config = UserConfig::load(&paths)?;
     let auto_index = config.auto_index_on_search_default();
     if auto_index {
@@ -935,6 +1009,9 @@ pub fn run(
     }
     if let Some(project) = initial_project {
         app.project = project;
+    }
+    if let Some(role) = initial_role {
+        app.role = RoleChoice::from_str_loose(&role);
     }
     app.kickoff_index_refresh(false);
     app.kickoff_search();
@@ -990,12 +1067,14 @@ impl App {
             home_machine_area: Rect::default(),
             home_source_area: Rect::default(),
             home_kind_area: Rect::default(),
+            home_role_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
             home_projects: Vec::new(),
             active_home_filters_request: 0,
             source: SourceChoice::All,
             session_kind: crate::analytics::SessionKindFilter::Primary,
+            role: RoleChoice::All,
             all_projects: Vec::new(),
             project_options: Vec::new(),
             project_selected: 0,
@@ -1039,6 +1118,7 @@ impl App {
             last_detail_session: None,
             last_detail_query: None,
             last_detail_mode: PreviewMode::Matches,
+            last_detail_role: RoleChoice::All,
             last_detail_find: None,
             status: String::new(),
             last_status_at: None,
@@ -1082,6 +1162,7 @@ impl App {
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
             || self.session_kind != crate::analytics::SessionKindFilter::All
+            || self.role != RoleChoice::All
     }
 
     fn home_chart_uses_search_results(&self) -> bool {
@@ -1216,13 +1297,14 @@ impl App {
             .map(|q| q != &query_now)
             .unwrap_or(true);
         let mode_changed = self.preview_mode != self.last_detail_mode;
+        let role_changed = self.role != self.last_detail_role;
         let find_now = self.find_query.trim().to_string();
         let find_changed = self
             .last_detail_find
             .as_ref()
             .map(|f| f != &find_now)
             .unwrap_or(true);
-        if !session_changed && !query_changed && !mode_changed && !find_changed {
+        if !session_changed && !query_changed && !mode_changed && !role_changed && !find_changed {
             return;
         }
         let active_query = if self.find_query.trim().is_empty() {
@@ -1241,12 +1323,14 @@ impl App {
         self.last_detail_session = Some(format!("{}:{}", session.machine, session.session_id));
         self.last_detail_query = Some(query_now);
         self.last_detail_mode = self.preview_mode;
+        self.last_detail_role = self.role;
         self.last_detail_find = Some(find_now);
         let request = DetailRequest {
             request_id,
             session,
             mode: self.preview_mode,
             query: active_query,
+            role: self.role,
             show_tools: self.show_tools,
         };
         if self.detail_tx.send(request).is_err() {
@@ -1264,6 +1348,7 @@ impl App {
         self.detail_scroll = 0;
         self.last_detail_session = None;
         self.last_detail_query = None;
+        self.last_detail_role = RoleChoice::All;
         self.last_detail_find = None;
     }
 
@@ -1288,6 +1373,7 @@ impl App {
             project: self.project.trim().to_string(),
             machines: self.selected_machines(),
             source: self.source,
+            role: self.role,
             since: self.sessions_since,
             grouping: self.project_display.grouping(),
             kind: self.session_kind,
@@ -1692,6 +1778,10 @@ impl App {
                 "subagent".to_string(),
                 "regular".to_string(),
             ],
+            HomeDropdown::Role => RoleChoice::ALL
+                .iter()
+                .map(|r| r.label().to_string())
+                .collect(),
             HomeDropdown::Project => {
                 let mut options = vec!["all projects".to_string()];
                 options.extend(self.home_projects.iter().cloned());
@@ -1728,6 +1818,10 @@ impl App {
                 crate::analytics::SessionKindFilter::Primary => 1,
                 crate::analytics::SessionKindFilter::Subagent => 2,
             },
+            HomeDropdown::Role => RoleChoice::ALL
+                .iter()
+                .position(|r| *r == self.role)
+                .unwrap_or(0),
             HomeDropdown::Project => self
                 .home_projects
                 .iter()
@@ -1768,6 +1862,8 @@ impl App {
         let previous_source = self.source;
         let kind_selection = self.home_dropdown == HomeDropdown::Kind;
         let previous_kind = self.session_kind;
+        let role_selection = self.home_dropdown == HomeDropdown::Role;
+        let previous_role = self.role;
         let project_selection = self.home_dropdown == HomeDropdown::Project;
         let previous_project = self.project.clone();
         let refresh_search = match self.home_dropdown {
@@ -1810,6 +1906,10 @@ impl App {
                 };
                 true
             }
+            HomeDropdown::Role => {
+                self.role = RoleChoice::ALL.get(idx).copied().unwrap_or(RoleChoice::All);
+                true
+            }
             HomeDropdown::Project => {
                 self.project = if idx == 0 {
                     String::new()
@@ -1823,11 +1923,12 @@ impl App {
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
         let kind_changed = kind_selection && self.session_kind != previous_kind;
+        let role_changed = role_selection && self.role != previous_role;
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
         let range_changed = range_selection && self.home_activity_range != previous_range;
         let token_filter_changed =
-            machine_changed || source_changed || project_changed || kind_changed;
+            machine_changed || source_changed || project_changed || kind_changed || role_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
@@ -2394,6 +2495,19 @@ impl App {
         self.kickoff_home_activity();
     }
 
+    fn cycle_role(&mut self) {
+        self.role = self.role.cycle();
+        self.set_status(format!("role: {}", self.role.label()));
+        self.last_detail_session = None;
+        self.invalidate_home_token_activity();
+        if matches!(self.layout_mode, LayoutMode::Timeline) {
+            self.kickoff_timeline_load();
+        } else {
+            self.refresh_results();
+            self.kickoff_home_activity();
+        }
+    }
+
     fn scroll_timeline(&mut self, delta: isize) {
         if self.timeline_rows.is_empty() {
             self.timeline_scroll = 0;
@@ -2493,6 +2607,7 @@ impl App {
             session,
             PreviewMode::Matches,
             active_query,
+            self.role,
             self.show_tools,
         ) {
             Ok(lines) => lines,
@@ -3036,6 +3151,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
         KeyCode::Char('c') => {
             app.cycle_session_kind();
         }
+        KeyCode::Char('u') => {
+            app.cycle_role();
+        }
         KeyCode::Char('[') => {
             app.cycle_timeline_range(-1);
         }
@@ -3106,6 +3224,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
             // `c` toggles the kind dropdown closed; `k` must keep moving
             // the selection up like in every other dropdown.
             KeyCode::Char('c') if app.home_dropdown == HomeDropdown::Kind => {
+                app.close_home_dropdown();
+            }
+            KeyCode::Char('u') if app.home_dropdown == HomeDropdown::Role => {
                 app.close_home_dropdown();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3212,6 +3333,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char('c') => {
             app.open_home_dropdown(HomeDropdown::Kind);
         }
+        KeyCode::Char('u') => {
+            app.open_home_dropdown(HomeDropdown::Role);
+        }
         KeyCode::Char('p') => {
             app.open_home_dropdown(HomeDropdown::Project);
         }
@@ -3305,6 +3429,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     app.home_machine_area = Rect::default();
     app.home_source_area = Rect::default();
     app.home_kind_area = Rect::default();
+    app.home_role_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
     if area.width < 8 || area.height < 4 {
@@ -3522,6 +3647,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             crate::analytics::SessionKindFilter::Subagent => "subagent",
         }
     );
+    let role_word = format!("{} ▾", app.role.label());
     let project_word = format!(
         "{} ▾",
         if app.project.trim().is_empty() {
@@ -3533,6 +3659,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
     let origin_width = origin_word.chars().count() as u16;
+    let role_width = role_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3544,13 +3671,16 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Constraint::Length(3),
             Constraint::Length(origin_width),
             Constraint::Length(3),
+            Constraint::Length(role_width),
+            Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
         .split(header_area);
     app.home_machine_area = header_cols[1];
     app.home_source_area = header_cols[3];
     app.home_kind_area = header_cols[5];
-    app.home_project_area = header_cols[7];
+    app.home_role_area = header_cols[7];
+    app.home_project_area = header_cols[9];
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
     let machine_style = if app.machine.is_empty() {
         theme.muted
@@ -3563,6 +3693,11 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         theme.accent
     };
     let kind_style = if app.session_kind == crate::analytics::SessionKindFilter::All {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    let role_style = if app.role == RoleChoice::All {
         theme.muted
     } else {
         theme.accent
@@ -3587,8 +3722,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         header_cols[5],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        Paragraph::new(Line::from(Span::styled(role_word, role_style))),
         header_cols[7],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        header_cols[9],
     );
     y += 1;
 
@@ -3664,6 +3803,7 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
         HomeDropdown::Machine => app.home_machine_area,
         HomeDropdown::Source => app.home_source_area,
         HomeDropdown::Kind => app.home_kind_area,
+        HomeDropdown::Role => app.home_role_area,
         HomeDropdown::Project => app.home_project_area,
         HomeDropdown::None => Rect::default(),
     };
@@ -4306,10 +4446,16 @@ fn draw_query_bar(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Re
         false,
     );
 
-    let right = Line::from(vec![
+    let mut right_spans = vec![
         Span::styled("source ", theme.muted),
         Span::styled(app.source.label(), theme.accent),
-    ]);
+    ];
+    if app.role != RoleChoice::All {
+        right_spans.push(Span::raw("   "));
+        right_spans.push(Span::styled("role ", theme.muted));
+        right_spans.push(Span::styled(app.role.label(), theme.accent));
+    }
+    let right = Line::from(right_spans);
     let right_width = right.width() as u16;
 
     let cols = Layout::default()
@@ -4932,6 +5078,11 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
+    if app.role != RoleChoice::All && app.layout_mode != LayoutMode::Timeline {
+        right_spans.push(Span::styled("role ", theme.muted));
+        right_spans.push(Span::styled(app.role.label(), theme.accent));
+        right_spans.push(Span::raw("   "));
+    }
     if app.session_kind != crate::analytics::SessionKindFilter::All
         || app.layout_mode == LayoutMode::Home
         || app.layout_mode == LayoutMode::List
@@ -5045,6 +5196,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" source  ", theme.muted),
             Span::styled("c", theme.accent),
             Span::styled(" origin  ", theme.muted),
+            Span::styled("u", theme.accent),
+            Span::styled(" role  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
             Span::styled("/", theme.accent),
@@ -5093,6 +5246,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
                 Span::styled(" project  ", theme.muted),
                 Span::styled("s", theme.accent),
                 Span::styled(" source  ", theme.muted),
+                Span::styled("u", theme.accent),
+                Span::styled(" role  ", theme.muted),
                 Span::styled("m", theme.accent),
                 Span::styled(" mode  ", theme.muted),
                 Span::styled("v", theme.accent),
@@ -5141,6 +5296,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" project  ", theme.muted),
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
+            Span::styled("u", theme.accent),
+            Span::styled(" role  ", theme.muted),
             Span::styled("m", theme.accent),
             Span::styled(" mode  ", theme.muted),
             Span::styled("v", theme.accent),
@@ -5194,6 +5351,7 @@ fn sessions_from_query(
     query: &str,
     source: Option<SourceFilter>,
     project: Option<&str>,
+    role: Option<&str>,
     since: Option<u64>,
     limit: usize,
 ) -> Result<Vec<SessionSummary>> {
@@ -5201,7 +5359,7 @@ fn sessions_from_query(
         query: query.to_string(),
         project: project.map(|s| s.to_string()),
         projects: None,
-        role: None,
+        role: role.map(|s| s.to_string()),
         tool: None,
         session_id: None,
         session_scope: None,
@@ -5246,6 +5404,7 @@ fn session_activity(sessions: &[SessionSummary]) -> Vec<HomeChartPoint> {
 fn sessions_from_recent(
     index: &SearchIndex,
     source: Option<SourceFilter>,
+    role: Option<&str>,
     since: Option<u64>,
     project: Option<&str>,
 ) -> Result<Vec<SessionSummary>> {
@@ -5258,6 +5417,11 @@ fn sessions_from_recent(
         }
         if let Some(source_filter) = source
             && !source_filter.matches(record.source)
+        {
+            continue;
+        }
+        if let Some(role_filter) = role
+            && !record.role.eq_ignore_ascii_case(role_filter)
         {
             continue;
         }
@@ -5458,7 +5622,8 @@ fn build_project_timeline(
         } else {
             RESULT_LIMIT * 5
         };
-        let mut sessions = sessions_from_query(&index, query, source, None, since, record_limit)?;
+        let mut sessions =
+            sessions_from_query(&index, query, source, None, None, since, record_limit)?;
         sessions.retain(|session| kind.matches_kind(session.conversation_kind.as_deref()));
         sessions.truncate(RESULT_LIMIT);
         enrich_session_projects(paths, &mut sessions, display.grouping());
@@ -5653,7 +5818,7 @@ fn run_search_request(
                 &SearchSpec {
                     query: request.query.clone(),
                     project: tantivy_project,
-                    role: None,
+                    role: request.role.as_str().map(str::to_string),
                     tool: None,
                     session_id: None,
                     session_scope: None,
@@ -5685,6 +5850,11 @@ fn run_search_request(
             {
                 continue;
             }
+            if let Some(role_filter) = request.role.as_str()
+                && !located.record.role.eq_ignore_ascii_case(role_filter)
+            {
+                continue;
+            }
             add_located_record_to_session(&mut by_session, located, &matchers);
         }
         let mut sessions: Vec<_> = by_session.into_values().collect();
@@ -5709,30 +5879,51 @@ fn run_search_request(
         return Ok((sessions, failures));
     }
     if request.query.is_empty() {
-        let mut sessions = sessions_from_analytics_filtered(
-            paths,
-            request.source.as_filter(),
-            request.since,
-            project,
-            request.grouping,
-            Some(request.kind),
-        )
-        .or_else(|_| {
-            let mut sessions =
-                sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
+        if request.role == RoleChoice::All {
+            let mut sessions = sessions_from_analytics_filtered(
+                paths,
+                request.source.as_filter(),
+                request.since,
+                project,
+                request.grouping,
+                Some(request.kind),
+            )
+            .or_else(|_| {
+                let mut sessions = sessions_from_recent(
+                    index,
+                    request.source.as_filter(),
+                    None,
+                    request.since,
+                    project,
+                )?;
+                sessions.retain(|session| {
+                    session_matches_kind(request.kind, session.conversation_kind.as_deref())
+                });
+                if sessions.is_empty() {
+                    anyhow::bail!("no analytics sessions");
+                }
+                Ok(sessions)
+            })?;
+            enrich_session_titles(index, &mut sessions);
             sessions.retain(|session| {
                 session_matches_kind(request.kind, session.conversation_kind.as_deref())
             });
-            if sessions.is_empty() {
-                anyhow::bail!("no analytics sessions");
-            }
-            Ok(sessions)
-        })?;
-        enrich_session_titles(index, &mut sessions);
-        sessions.retain(|session| {
-            session_matches_kind(request.kind, session.conversation_kind.as_deref())
-        });
-        return Ok((sessions, Vec::new()));
+            return Ok((sessions, Vec::new()));
+        } else {
+            let mut sessions = sessions_from_recent(
+                index,
+                request.source.as_filter(),
+                request.role.as_str(),
+                request.since,
+                project,
+            )?;
+            enrich_session_projects(paths, &mut sessions, request.grouping);
+            sessions.retain(|session| {
+                session_matches_kind(request.kind, session.conversation_kind.as_deref())
+            });
+            sessions.truncate(RESULT_LIMIT);
+            return Ok((sessions, Vec::new()));
+        }
     }
 
     let tantivy_project = if request.grouping == ProjectGrouping::Flat {
@@ -5753,6 +5944,7 @@ fn run_search_request(
         &request.query,
         request.source.as_filter(),
         tantivy_project,
+        request.role.as_str(),
         request.since,
         record_limit,
     )?;
@@ -5790,6 +5982,7 @@ fn spawn_detail_worker(
                     &request.session,
                     request.mode,
                     &request.query,
+                    request.role,
                     request.show_tools,
                 )
             }) {
@@ -5814,10 +6007,11 @@ fn build_detail_lines(
     session: &SessionSummary,
     mode: PreviewMode,
     query: &str,
+    role: RoleChoice,
     show_tools: bool,
 ) -> Result<Vec<PreviewLine>> {
     let records = index.records_by_session_id(&session.session_id)?;
-    build_detail_lines_from_records(records, session, mode, query, show_tools)
+    build_detail_lines_from_records(records, session, mode, query, role, show_tools)
 }
 
 fn build_detail_lines_from_records(
@@ -5825,6 +6019,7 @@ fn build_detail_lines_from_records(
     session: &SessionSummary,
     mode: PreviewMode,
     query: &str,
+    role: RoleChoice,
     show_tools: bool,
 ) -> Result<Vec<PreviewLine>> {
     records.retain(|record| record.source_path == session.source_path);
@@ -5854,12 +6049,20 @@ fn build_detail_lines_from_records(
     }
     lines.push(PreviewLine::Empty);
 
+    let role_matches = |r_role: &str| -> bool {
+        match role.as_str() {
+            Some(expected) => r_role.eq_ignore_ascii_case(expected),
+            None => true,
+        }
+    };
+
     match mode {
         PreviewMode::Matches => {
             let query = query.trim();
             if query.is_empty() {
                 let tail = records
                     .into_iter()
+                    .filter(|r| role_matches(&r.role))
                     .rev()
                     .take(DETAIL_TAIL_LINES)
                     .collect::<Vec<_>>();
@@ -5872,6 +6075,9 @@ fn build_detail_lines_from_records(
                     let mut matches_all = false;
                     let mut matches_non_tools = false;
                     for record in records.iter() {
+                        if !role_matches(&record.role) {
+                            continue;
+                        }
                         if matches_any(&record.text, &matchers) {
                             matches_all = true;
                             if !is_tool_role(&record.role) {
@@ -5881,6 +6087,9 @@ fn build_detail_lines_from_records(
                     }
                     let mut indices = Vec::new();
                     for (idx, record) in records.iter().enumerate() {
+                        if !role_matches(&record.role) {
+                            continue;
+                        }
                         if !show_tools && is_tool_role(&record.role) {
                             continue;
                         }
@@ -5890,9 +6099,16 @@ fn build_detail_lines_from_records(
                     }
                     if indices.is_empty() {
                         if !matches_all {
-                            lines.push(PreviewLine::Text(
-                                "no literal matches (search matched via tokenizer)".to_string(),
-                            ));
+                            if role != RoleChoice::All {
+                                lines.push(PreviewLine::Text(format!(
+                                    "no matches for role '{}'",
+                                    role.label()
+                                )));
+                            } else {
+                                lines.push(PreviewLine::Text(
+                                    "no literal matches (search matched via tokenizer)".to_string(),
+                                ));
+                            }
                         } else if !show_tools && !matches_non_tools {
                             lines.push(PreviewLine::Text(
                                 "matches only in tool messages (press t to show)".to_string(),
@@ -5908,6 +6124,9 @@ fn build_detail_lines_from_records(
                             for (i, record) in records.iter().enumerate().take(end + 1).skip(start)
                             {
                                 if !show_tools && is_tool_role(&record.role) {
+                                    continue;
+                                }
+                                if !role_matches(&record.role) {
                                     continue;
                                 }
                                 if let Some(last) = last_added
@@ -6834,6 +7053,8 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
                 app.open_home_dropdown(HomeDropdown::Source);
             } else if app.home_kind_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Kind);
+            } else if app.home_role_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Role);
             } else if app.home_project_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Project);
             } else if app.home_list_area.contains(pos) && app.home_list_area.height > 0 {
@@ -8283,9 +8504,16 @@ mod tests {
             .expect("add recent");
         writer.commit().expect("commit");
 
-        let sessions =
-            sessions_from_query(&app.index, "needle", None, None, Some(50), RESULT_LIMIT)
-                .expect("search");
+        let sessions = sessions_from_query(
+            &app.index,
+            "needle",
+            None,
+            None,
+            None,
+            Some(50),
+            RESULT_LIMIT,
+        )
+        .expect("search");
 
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].session_id, "recent");
@@ -8618,5 +8846,173 @@ mod tests {
 
         assert!(matches!(preview, Cow::Borrowed(_)));
         assert_eq!(preview, text);
+    }
+
+    #[test]
+    fn role_choice_cycle_and_parsing() {
+        assert_eq!(RoleChoice::All.cycle(), RoleChoice::User);
+        assert_eq!(RoleChoice::User.cycle(), RoleChoice::Assistant);
+        assert_eq!(RoleChoice::Assistant.cycle(), RoleChoice::ToolUse);
+        assert_eq!(RoleChoice::ToolUse.cycle(), RoleChoice::ToolResult);
+        assert_eq!(RoleChoice::ToolResult.cycle(), RoleChoice::Reasoning);
+        assert_eq!(RoleChoice::Reasoning.cycle(), RoleChoice::All);
+
+        assert_eq!(RoleChoice::All.as_str(), None);
+        assert_eq!(RoleChoice::User.as_str(), Some("user"));
+        assert_eq!(RoleChoice::Assistant.as_str(), Some("assistant"));
+        assert_eq!(RoleChoice::ToolUse.as_str(), Some("tool_use"));
+        assert_eq!(RoleChoice::ToolResult.as_str(), Some("tool_result"));
+        assert_eq!(RoleChoice::Reasoning.as_str(), Some("reasoning"));
+
+        assert_eq!(RoleChoice::from_str_loose("USER"), RoleChoice::User);
+        assert_eq!(
+            RoleChoice::from_str_loose("assistant"),
+            RoleChoice::Assistant
+        );
+        assert_eq!(RoleChoice::from_str_loose("tool"), RoleChoice::ToolUse);
+        assert_eq!(
+            RoleChoice::from_str_loose("tool-result"),
+            RoleChoice::ToolResult
+        );
+        assert_eq!(
+            RoleChoice::from_str_loose("reasoning"),
+            RoleChoice::Reasoning
+        );
+        assert_eq!(RoleChoice::from_str_loose("unknown"), RoleChoice::All);
+    }
+
+    #[test]
+    fn sessions_from_query_filters_by_role() {
+        let (_tmp, app) = test_app();
+        let mut writer = app.index.writer().expect("writer");
+        let mut user_rec = record("user", "unique_keyword in user prompt");
+        user_rec.doc_id = 1;
+        user_rec.session_id = "user_session".to_string();
+        user_rec.source_path = "user.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &user_rec)
+            .expect("add user");
+
+        let mut asst_rec = record("assistant", "unique_keyword in assistant answer");
+        asst_rec.doc_id = 2;
+        asst_rec.session_id = "asst_session".to_string();
+        asst_rec.source_path = "asst.jsonl".to_string();
+        app.index
+            .add_record(&mut writer, &asst_rec)
+            .expect("add asst");
+        writer.commit().expect("commit");
+
+        let user_only = sessions_from_query(
+            &app.index,
+            "unique_keyword",
+            None,
+            None,
+            Some("user"),
+            None,
+            RESULT_LIMIT,
+        )
+        .expect("search user");
+        assert_eq!(user_only.len(), 1);
+        assert_eq!(user_only[0].session_id, "user_session");
+
+        let asst_only = sessions_from_query(
+            &app.index,
+            "unique_keyword",
+            None,
+            None,
+            Some("assistant"),
+            None,
+            RESULT_LIMIT,
+        )
+        .expect("search asst");
+        assert_eq!(asst_only.len(), 1);
+        assert_eq!(asst_only[0].session_id, "asst_session");
+
+        let all = sessions_from_query(
+            &app.index,
+            "unique_keyword",
+            None,
+            None,
+            None,
+            None,
+            RESULT_LIMIT,
+        )
+        .expect("search all");
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn build_detail_lines_filters_matches_by_role() {
+        let session = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "session".to_string(),
+            project: "project".to_string(),
+            source: SourceKind::Claude,
+            last_ts: 100,
+            hit_count: 2,
+            top_score: 1.0,
+            snippet: String::new(),
+            source_dir: "/tmp".to_string(),
+            source_path: "source.jsonl".to_string(),
+            label: None,
+            conversation_kind: None,
+        };
+
+        let mut user_rec = record("user", "target keyword from user");
+        user_rec.turn_id = 1;
+        let mut asst_rec = record("assistant", "target keyword from assistant");
+        asst_rec.turn_id = 2;
+
+        let records = vec![user_rec, asst_rec];
+
+        let user_lines = build_detail_lines_from_records(
+            records.clone(),
+            &session,
+            PreviewMode::Matches,
+            "target",
+            RoleChoice::User,
+            true,
+        )
+        .expect("build user lines");
+
+        let text_content: Vec<String> = user_lines
+            .iter()
+            .filter_map(|l| match l {
+                PreviewLine::Text(t) => Some(t.clone()),
+                PreviewLine::Styled { spans, .. } => Some(
+                    spans
+                        .iter()
+                        .map(|s| s.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert!(text_content.iter().any(|t| t.contains("from user")));
+        assert!(!text_content.iter().any(|t| t.contains("from assistant")));
+
+        let tool_lines = build_detail_lines_from_records(
+            records,
+            &session,
+            PreviewMode::Matches,
+            "target",
+            RoleChoice::ToolUse,
+            true,
+        )
+        .expect("build tool lines");
+
+        let tool_text: Vec<String> = tool_lines
+            .iter()
+            .filter_map(|l| match l {
+                PreviewLine::Text(t) => Some(t.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            tool_text
+                .iter()
+                .any(|t| t.contains("no matches for role 'tool_use'"))
+        );
     }
 }

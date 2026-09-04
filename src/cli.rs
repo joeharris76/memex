@@ -379,6 +379,9 @@ OUTPUT FIELDS (--fields):
         /// Start with this project filter
         #[arg(long)]
         project: Option<String>,
+        /// Filter by role (user, assistant, tool_use, tool_result)
+        #[arg(long)]
+        role: Option<String>,
         /// Path to memex data directory [default: ~/.memex]
         #[arg(long)]
         root: Option<PathBuf>,
@@ -1261,6 +1264,7 @@ pub fn run() -> Result<()> {
         .unwrap_or(Commands::Tui {
             query: None,
             project: None,
+            role: None,
             root: None,
         })
         .canonicalize();
@@ -1403,6 +1407,7 @@ pub fn run() -> Result<()> {
         Commands::Tui {
             query,
             project,
+            role,
             root,
         } => {
             if !interactive {
@@ -1424,7 +1429,7 @@ pub fn run() -> Result<()> {
                 let _ = tx.send(format!("update: v{latest} (memex update)"));
                 rx
             });
-            tui::run(root, update_rx, query, project)?;
+            tui::run(root, update_rx, query, project, role)?;
         }
         Commands::Web { listen, root, .. } => {
             crate::web::serve(root, &listen)?;
