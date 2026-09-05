@@ -1226,17 +1226,10 @@ mod tests {
 
         let plan = parse_database_session(&path, "ses_plan", 0, &AtomicU64::new(1)).unwrap();
         assert_eq!(plan.len(), 1);
-        assert_eq!(
-            plan[0].links.conversation_kind.as_deref(),
-            Some("main")
-        );
-        let child =
-            parse_database_session(&path, "ses_child", 0, &AtomicU64::new(10)).unwrap();
+        assert_eq!(plan[0].links.conversation_kind.as_deref(), Some("main"));
+        let child = parse_database_session(&path, "ses_child", 0, &AtomicU64::new(10)).unwrap();
         assert_eq!(child.len(), 1);
-        assert_eq!(
-            child[0].links.conversation_kind.as_deref(),
-            Some("fork")
-        );
+        assert_eq!(child[0].links.conversation_kind.as_deref(), Some("fork"));
     }
 
     #[test]

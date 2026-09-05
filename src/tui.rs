@@ -5707,7 +5707,7 @@ fn run_search_request(
     } else {
         None
     };
-<    // Over-fetch when an origin filter is active: the kind filter applies
+    // Over-fetch when an origin filter is active: the kind filter applies
     // after grouping, so capping the record query at RESULT_LIMIT first
     // could starve interactive matches in subagent-heavy corpora.
     let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {

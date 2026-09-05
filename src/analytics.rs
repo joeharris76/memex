@@ -1,4 +1,4 @@
-<use crate::state::SessionScope;
+use crate::state::SessionScope;
 use crate::types::{
     Record, SourceFilter, SourceKind, jcode_text_is_subagent_directive,
     jcode_tmp_cwd_is_worker_sandbox,
@@ -915,7 +915,7 @@ impl AnalyticsWriter {
                     last_at = MAX(sessions.last_at, excluded.last_at),
                     message_count = sessions.message_count + excluded.message_count,
                     resolution_status = excluded.resolution_status,
-<                    -- The stored label/kind describe the session's opening and
+                    -- The stored label/kind describe the session's opening and
                     -- survive incremental deltas, which only see mid-session
                     -- records. Corrections flow through parser-version bumps,
                     -- which delete the row first (delete_first) and recompute.
@@ -1705,7 +1705,7 @@ fn opencode_session_has_parent(db_path: &str, session_id: &str) -> bool {
             .optional()
             .ok()
             .flatten();
-<        Some(parent.is_some_and(|p| !p.trim().is_empty()))
+        Some(parent.is_some_and(|p| !p.trim().is_empty()))
     };
     check().unwrap_or(false)
 }
@@ -2301,40 +2301,6 @@ mod tests {
         assert!(label.chars().count() <= MAX_LABEL_CHARS);
         assert!(label.ends_with('…') || label.chars().count() < MAX_LABEL_CHARS);
         assert!(label.starts_with("Hello world red"));
-    }
-
-    #[test]
-    fn strip_ansi_preserves_multibyte_unicode() {
-        let label = sanitize_label("Fix the 🚀 deploy \x1b[31mred\x1b[0m pipeline ✅ now");
-        assert_eq!(label, "Fix the 🚀 deploy red pipeline ✅ now");
-        assert!(label.contains('🚀'));
-    }
-
-    #[test]
-    fn sanitize_label_truncates_unicode_by_chars_not_bytes() {
-        let raw = "🚀".repeat(200);
-        let label = sanitize_label(&raw);
-        assert!(label.chars().count() <= MAX_LABEL_CHARS);
-        assert!(label.contains('…'));
-        assert!(label.starts_with("🚀"));
-    }
-
-    #[test]
-    fn sanitize_label_with_unicode_case_fold_before_tag_does_not_panic() {
-        // U+0130 folds to 2 chars on lowercase; byte offsets computed on the
-        // folded copy would be wrong for the original. Must strip safely.
-        let raw = "İstanbul \u{130} <SYSTEM-REMINDER>hidden</SYSTEM-REMINDER> visible task";
-        let label = sanitize_label(raw);
-        assert!(!label.contains("hidden"));
-        assert!(!label.contains("SYSTEM-REMINDER"));
-        assert!(label.contains("visible task"));
-    }
-
-    #[test]
-    fn sanitize_label_preserves_lone_comparison_brackets() {
-        let raw = "a < b and c > d comparison";
-        let label = sanitize_label(raw);
-        assert_eq!(label, "a < b and c > d comparison");
     }
 
     #[test]

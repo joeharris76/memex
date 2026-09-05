@@ -240,7 +240,7 @@ fn prepare_file_task(
             previous.pending_tool_calls.clone(),
             true,
         ),
-<        // A jcode session is one JSON object, so a byte offset cannot resume
+        // A jcode session is one JSON object, so a byte offset cannot resume
         // mid-file and the parser always emits from message zero. Reparse
         // atomically instead: delete_first purges the stale rows first, so
         // growing files can neither duplicate records nor inflate counts.
