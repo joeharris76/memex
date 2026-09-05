@@ -17,7 +17,10 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    // Bumped for per-event subagent origin flags: already-indexed
+    // transcripts must reparse so historical inline subagent events
+    // classify by event flags instead of path-only logic.
+    index: 3,
     usage: 3,
 };
 
@@ -145,6 +148,7 @@ pub(crate) fn parse_index_records(
         let Some(message) = object.get("message").and_then(|value| value.as_object()) else {
             continue;
         };
+        let subagent_flag = is_subagent_event(object, Some(message));
         let mut text_parts = Vec::new();
         if let Some(content) = message.get("content") {
             if let Some(text) = content.as_str() {
@@ -175,7 +179,12 @@ pub(crate) fn parse_index_records(
                                     block_object.get(*key).and_then(|value| value.as_str())
                                 })
                                 .map(str::to_string);
-                            let mut links = record_links(path, &session_id, turn_id);
+                            let mut links = record_links_with_subagent(
+                                path,
+                                &session_id,
+                                turn_id,
+                                subagent_flag,
+                            );
                             links.event_id = tool_id.clone();
                             let doc_id = next_doc_id.fetch_add(1, Ordering::SeqCst);
                             if let Some(tool_id) = tool_id {
@@ -230,7 +239,12 @@ pub(crate) fn parse_index_records(
                                 .and_then(|id| pending_tool_calls.remove(id));
                             let tool_name = super::common::borrowed_string(block_object, "name")
                                 .or_else(|| pending.and_then(|call| call.tool_name));
-                            let mut links = record_links(path, &session_id, turn_id);
+                            let mut links = record_links_with_subagent(
+                                path,
+                                &session_id,
+                                turn_id,
+                                subagent_flag,
+                            );
                             if let Some(tool_use_id) = tool_use_id {
                                 links.parent_event_id = Some(tool_use_id.clone());
                                 links.parent_tool_use_id = Some(tool_use_id);
@@ -271,7 +285,7 @@ pub(crate) fn parse_index_records(
                 tool_name: None,
                 tool_input: None,
                 tool_output: None,
-                links: record_links(path, &session_id, turn_id),
+                links: record_links_with_subagent(path, &session_id, turn_id, subagent_flag),
                 source_path: source_path.clone(),
             })?;
             turn_id += 1;
@@ -309,8 +323,54 @@ fn is_subagent_transcript(path: &Path) -> bool {
         .any(|component| component.as_os_str().to_str() == Some("subagents"))
 }
 
-pub(crate) fn record_links(path: &Path, session_id: &str, turn_id: u32) -> RecordLinks {
-    let is_subagent = is_subagent_transcript(path);
+fn is_subagent_event(
+    object: &simd_json::borrowed::Object<'_>,
+    message: Option<&simd_json::borrowed::Object<'_>>,
+) -> bool {
+    let check_val = |v: &BorrowedValue<'_>| -> bool {
+        if let Some(b) = v.as_bool() {
+            return b;
+        }
+        if let Some(s) = v.as_str() {
+            return s.eq_ignore_ascii_case("subagent") || s.eq_ignore_ascii_case("true");
+        }
+        if v.as_object().is_some() {
+            return true;
+        }
+        false
+    };
+
+    for key in [
+        "is_subagent",
+        "isSubagent",
+        "subagent",
+        "is_subagent_turn",
+        "isSubagentTurn",
+        "subagentId",
+        "subagent_id",
+    ] {
+        if let Some(v) = object.get(key)
+            && check_val(v)
+        {
+            return true;
+        }
+        if let Some(msg) = message
+            && let Some(v) = msg.get(key)
+            && check_val(v)
+        {
+            return true;
+        }
+    }
+    false
+}
+
+pub(crate) fn record_links_with_subagent(
+    path: &Path,
+    session_id: &str,
+    turn_id: u32,
+    is_subagent_event: bool,
+) -> RecordLinks {
+    let is_subagent = is_subagent_transcript(path) || is_subagent_event;
     RecordLinks {
         event_id: Some(format!("{}:{turn_id}", transcript_id(path))),
         parent_session_id: is_subagent.then(|| session_id.to_string()),
@@ -318,6 +378,11 @@ pub(crate) fn record_links(path: &Path, session_id: &str, turn_id: u32) -> Recor
         conversation_kind: Some(if is_subagent { "subagent" } else { "main" }.to_string()),
         ..RecordLinks::default()
     }
+}
+
+#[allow(dead_code)]
+pub(crate) fn record_links(path: &Path, session_id: &str, turn_id: u32) -> RecordLinks {
+    record_links_with_subagent(path, session_id, turn_id, false)
 }
 
 fn stable_turn_bucket(value: &str) -> u32 {
@@ -609,5 +674,36 @@ mod tests {
             53
         );
         assert_eq!(events[0].project.as_deref(), Some("memex"));
+    }
+
+    #[test]
+    fn parses_subagent_flag_from_event_json() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("transcript.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"role":"user","is_subagent":true,"message":{"content":"subagent instruction"}}"#
+                .as_bytes(),
+        )
+        .unwrap();
+
+        let mut records = Vec::new();
+        let _ = parse_index_records(
+            &path,
+            0,
+            IndexParseState::default(),
+            &AtomicU64::new(1),
+            |record| {
+                records.push(record);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 1);
+        assert_eq!(
+            records[0].links.conversation_kind.as_deref(),
+            Some("subagent")
+        );
     }
 }

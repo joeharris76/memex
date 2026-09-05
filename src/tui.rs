@@ -397,6 +397,7 @@ enum HomeDropdown {
     Range,
     Machine,
     Source,
+    Kind,
     Project,
 }
 
@@ -579,6 +580,7 @@ struct App {
     home_range_area: Rect,
     home_machine_area: Rect,
     home_source_area: Rect,
+    home_kind_area: Rect,
     home_project_area: Rect,
     home_sources: Vec<SourceChoice>,
     home_projects: Vec<String>,
@@ -633,6 +635,7 @@ enum PreviewLine {
         project: String,
         source: String,
         session_id: String,
+        kind: Option<String>,
     },
     Meta {
         role: String,
@@ -969,6 +972,7 @@ impl App {
             home_range_area: Rect::default(),
             home_machine_area: Rect::default(),
             home_source_area: Rect::default(),
+            home_kind_area: Rect::default(),
             home_project_area: Rect::default(),
             home_sources: Vec::new(),
             home_projects: Vec::new(),
@@ -1053,6 +1057,7 @@ impl App {
             || !self.machine.is_empty()
             || self.source != SourceChoice::All
             || !self.project.trim().is_empty()
+            || self.session_kind != crate::analytics::SessionKindFilter::All
     }
 
     fn home_chart_uses_search_results(&self) -> bool {
@@ -1384,6 +1389,7 @@ impl App {
         let config = self.config.clone();
         let machines = self.selected_machines();
         let source = self.source.as_filter();
+        let session_kind = self.session_kind;
         let project = (!self.project.trim().is_empty()).then(|| self.project.trim().to_string());
         let project_grouping = self.project_display.grouping();
         let tx = self.search_tx.clone();
@@ -1399,6 +1405,7 @@ impl App {
                         None,
                         project.as_deref(),
                         project_grouping,
+                        Some(session_kind),
                     )?;
                     Ok((
                         rows.into_iter()
@@ -1423,6 +1430,7 @@ impl App {
                         project_grouping,
                         since_ms,
                         until_ms: None,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(points, partial)| {
@@ -1482,7 +1490,8 @@ impl App {
                 .map(|(_, source, session_id)| (source.clone(), session_id.clone()))
                 .collect()
         });
-        let query = home_token_usage_query(
+        let session_kind = self.session_kind;
+        let mut query = home_token_usage_query(
             self.source,
             &self.project,
             self.project_display.grouping(),
@@ -1508,6 +1517,7 @@ impl App {
                         cost_mode: query.cost_mode,
                         include_events: false,
                         memo_ttl_ms: query.memo_ttl_ms,
+                        kind: Some(session_kind),
                     },
                 )
                 .map(|(events, partial)| {
@@ -1538,6 +1548,23 @@ impl App {
                     }),
                 };
                 return;
+            }
+            // A text search already restricts `session_keys` to the
+            // origin-filtered results; with an empty query the usage scan
+            // is otherwise unfiltered, so resolve the origin here.
+            if query.session_keys.is_none()
+                && session_kind != crate::analytics::SessionKindFilter::All
+            {
+                match crate::machine::usage_session_keys_for_kind(&paths, session_kind) {
+                    Ok(keys) => query.session_keys = Some(keys),
+                    Err(error) => {
+                        let _ = tx.send(SearchUpdate::HomeTokenActivityError {
+                            request_id,
+                            message: error.to_string(),
+                        });
+                        return;
+                    }
+                }
             }
             let result = scan_usage_activity(&query).map(|(events, partial)| {
                 let points = events
@@ -1628,6 +1655,11 @@ impl App {
                 options.extend(self.home_sources.iter().map(|s| s.label().to_string()));
                 options
             }
+            HomeDropdown::Kind => vec![
+                "all".to_string(),
+                "interactive".to_string(),
+                "subagent".to_string(),
+            ],
             HomeDropdown::Project => {
                 let mut options = vec!["all projects".to_string()];
                 options.extend(self.home_projects.iter().cloned());
@@ -1658,6 +1690,11 @@ impl App {
                 .position(|s| *s == self.source)
                 .map(|idx| idx + 1)
                 .unwrap_or(0),
+            HomeDropdown::Kind => match self.session_kind {
+                crate::analytics::SessionKindFilter::All => 0,
+                crate::analytics::SessionKindFilter::Primary => 1,
+                crate::analytics::SessionKindFilter::Subagent => 2,
+            },
             HomeDropdown::Project => self
                 .home_projects
                 .iter()
@@ -1690,11 +1727,14 @@ impl App {
             self.close_home_dropdown();
             return;
         };
-        let refresh_activity = self.home_dropdown == HomeDropdown::Range;
+        let range_selection = self.home_dropdown == HomeDropdown::Range;
+        let previous_range = self.home_activity_range;
         let machine_selection = self.home_dropdown == HomeDropdown::Machine;
         let previous_machine = self.machine.clone();
         let source_selection = self.home_dropdown == HomeDropdown::Source;
         let previous_source = self.source;
+        let kind_selection = self.home_dropdown == HomeDropdown::Kind;
+        let previous_kind = self.session_kind;
         let project_selection = self.home_dropdown == HomeDropdown::Project;
         let previous_project = self.project.clone();
         let refresh_search = match self.home_dropdown {
@@ -1703,7 +1743,10 @@ impl App {
                     .get(idx)
                     .copied()
                     .unwrap_or(TimelineRange::Month);
-                false
+                // The timeframe filters the chart and the recent list alike:
+                // sync the list's `since` bound (All clears it back to None).
+                self.sessions_since = self.home_activity_range.since_ms(now_ms());
+                true
             }
             HomeDropdown::Machine => {
                 self.machine = if idx == 0 {
@@ -1724,6 +1767,15 @@ impl App {
                 };
                 true
             }
+            HomeDropdown::Kind => {
+                self.session_kind = match idx {
+                    0 => crate::analytics::SessionKindFilter::All,
+                    1 => crate::analytics::SessionKindFilter::Primary,
+                    2 => crate::analytics::SessionKindFilter::Subagent,
+                    _ => crate::analytics::SessionKindFilter::Primary,
+                };
+                true
+            }
             HomeDropdown::Project => {
                 self.project = if idx == 0 {
                     String::new()
@@ -1736,18 +1788,21 @@ impl App {
         };
         self.close_home_dropdown();
         let source_changed = source_selection && self.source != previous_source;
+        let kind_changed = kind_selection && self.session_kind != previous_kind;
         let project_changed = project_selection && self.project != previous_project;
         let machine_changed = machine_selection && self.machine != previous_machine;
-        let token_filter_changed = machine_changed || source_changed || project_changed;
+        let range_changed = range_selection && self.home_activity_range != previous_range;
+        let token_filter_changed =
+            machine_changed || source_changed || project_changed || kind_changed;
         if token_filter_changed {
             self.invalidate_home_token_activity();
         }
         if refresh_search {
             self.kickoff_search();
-            if token_filter_changed {
+            if token_filter_changed || range_changed {
                 self.kickoff_home_activity();
             }
-        } else if refresh_activity {
+        } else if range_changed {
             self.kickoff_home_activity();
         }
     }
@@ -2287,7 +2342,7 @@ impl App {
             }
         };
         let label = match self.session_kind {
-            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::All => "all",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
         };
@@ -2934,7 +2989,7 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.kickoff_home_activity();
             }
         }
-        KeyCode::Char('K') => {
+        KeyCode::Char('c') => {
             app.cycle_session_kind();
         }
         KeyCode::Char('[') => {
@@ -3002,6 +3057,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
     if app.home_dropdown != HomeDropdown::None {
         match key.code {
             KeyCode::Esc => {
+                app.close_home_dropdown();
+            }
+            // `c` toggles the kind dropdown closed; `k` must keep moving
+            // the selection up like in every other dropdown.
+            KeyCode::Char('c') if app.home_dropdown == HomeDropdown::Kind => {
                 app.close_home_dropdown();
             }
             KeyCode::Up | KeyCode::Char('k') => {
@@ -3105,11 +3165,11 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         KeyCode::Char('s') => {
             app.open_home_dropdown(HomeDropdown::Source);
         }
+        KeyCode::Char('c') => {
+            app.open_home_dropdown(HomeDropdown::Kind);
+        }
         KeyCode::Char('p') => {
             app.open_home_dropdown(HomeDropdown::Project);
-        }
-        KeyCode::Char('K') => {
-            app.cycle_session_kind();
         }
         KeyCode::Char('S') => {
             let _ = app.share_selected();
@@ -3200,6 +3260,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     app.home_range_area = Rect::default();
     app.home_machine_area = Rect::default();
     app.home_source_area = Rect::default();
+    app.home_kind_area = Rect::default();
     app.home_project_area = Rect::default();
     app.home_dropdown_area = Rect::default();
     if area.width < 8 || area.height < 4 {
@@ -3382,7 +3443,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     y += 4;
 
-    // Header row: label on the left, machine/source/project dropdown anchors on the right.
+    // Header row: label on the left, machine/source/kind/project dropdown anchors on the right.
     let searching = !app.query.trim().is_empty();
     let header_area = col(y, 1);
     let mut header_spans = vec![Span::styled(
@@ -3408,6 +3469,14 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         String::new()
     };
     let source_word = format!("{} ▾", app.source.label());
+    let origin_word = format!(
+        "{} ▾",
+        match app.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "interactive",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+        }
+    );
     let project_word = format!(
         "{} ▾",
         if app.project.trim().is_empty() {
@@ -3418,6 +3487,7 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
     );
     let machine_width = machine_word.chars().count() as u16;
     let source_width = source_word.chars().count() as u16;
+    let origin_width = origin_word.chars().count() as u16;
     let project_width_hdr = project_word.chars().count() as u16;
     let header_cols = Layout::default()
         .direction(Direction::Horizontal)
@@ -3427,12 +3497,15 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
             Constraint::Length(if machine_width > 0 { 3 } else { 0 }),
             Constraint::Length(source_width),
             Constraint::Length(3),
+            Constraint::Length(origin_width),
+            Constraint::Length(3),
             Constraint::Length(project_width_hdr),
         ])
         .split(header_area);
     app.home_machine_area = header_cols[1];
     app.home_source_area = header_cols[3];
-    app.home_project_area = header_cols[5];
+    app.home_kind_area = header_cols[5];
+    app.home_project_area = header_cols[7];
     frame.render_widget(Paragraph::new(Line::from(header_spans)), header_cols[0]);
     let machine_style = if app.machine.is_empty() {
         theme.muted
@@ -3440,6 +3513,11 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         theme.accent
     };
     let source_style = if app.source == SourceChoice::All {
+        theme.muted
+    } else {
+        theme.accent
+    };
+    let kind_style = if app.session_kind == crate::analytics::SessionKindFilter::All {
         theme.muted
     } else {
         theme.accent
@@ -3460,8 +3538,12 @@ fn draw_home(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, area: Rec
         header_cols[3],
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        Paragraph::new(Line::from(Span::styled(origin_word, kind_style))),
         header_cols[5],
+    );
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(project_word, project_style))),
+        header_cols[7],
     );
     y += 1;
 
@@ -3535,20 +3617,15 @@ fn draw_home_dropdown(frame: &mut ratatui::Frame, app: &mut App, theme: &Theme, 
         HomeDropdown::Range => app.home_range_area,
         HomeDropdown::Machine => app.home_machine_area,
         HomeDropdown::Source => app.home_source_area,
+        HomeDropdown::Kind => app.home_kind_area,
         HomeDropdown::Project => app.home_project_area,
         HomeDropdown::None => Rect::default(),
     };
     if anchor.width == 0 {
         return;
     }
-    let width = options
-        .iter()
-        .map(|o| o.chars().count())
-        .max()
-        .unwrap_or(8)
-        .clamp(8, 32) as u16
-        + 2;
-    let width = width.min(area.width);
+    let max_len = options.iter().map(|o| o.chars().count()).max().unwrap_or(8);
+    let width = ((max_len as u16).clamp(8, 42) + 2).min(area.width);
     let x = anchor
         .right()
         .saturating_sub(width)
@@ -4838,12 +4915,12 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         || app.layout_mode == LayoutMode::Split
     {
         let kind_label = match app.session_kind {
-            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::Primary => "interactive",
             crate::analytics::SessionKindFilter::Subagent => "subagent",
             crate::analytics::SessionKindFilter::All => "all",
         };
-        right_spans.push(Span::styled("kind ", theme.muted));
-        right_spans.push(Span::styled("(K) ", theme.accent));
+        right_spans.push(Span::styled("origin ", theme.muted));
+        right_spans.push(Span::styled("(c) ", theme.accent));
         right_spans.push(Span::styled(kind_label, theme.text));
         right_spans.push(Span::raw("   "));
     }
@@ -4942,10 +5019,10 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" timeframe  ", theme.muted),
             Span::styled("s", theme.accent),
             Span::styled(" source  ", theme.muted),
+            Span::styled("c", theme.accent),
+            Span::styled(" origin  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
-            Span::styled("K", theme.accent),
-            Span::styled(" kind  ", theme.muted),
             Span::styled("/", theme.accent),
             Span::styled(" search  ", theme.muted),
             Span::styled("tab", theme.accent),
@@ -5218,11 +5295,7 @@ fn sessions_from_analytics_filtered(
 }
 
 fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Option<&str>) -> bool {
-    match filter {
-        crate::analytics::SessionKindFilter::All => true,
-        crate::analytics::SessionKindFilter::Primary => kind.is_none() || kind == Some("main"),
-        crate::analytics::SessionKindFilter::Subagent => kind.is_some() && kind != Some("main"),
-    }
+    filter.matches_kind(kind)
 }
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
@@ -5413,6 +5486,14 @@ fn add_record_to_session(
             conversation_kind: label.clone(),
         });
     entry.hit_count += 1;
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     if record.ts > entry.last_ts {
         entry.last_ts = record.ts;
     }
@@ -5457,6 +5538,14 @@ fn add_located_record_to_session(
         conversation_kind: record.links.conversation_kind.clone(),
     });
     entry.hit_count += 1;
+    // Prefer an explicit "main": sidechain/compaction lines inside a primary
+    // session must not determine the grouped kind (mirrors the analytics
+    // accumulator).
+    let main_claim = record.links.conversation_kind.as_deref() == Some("main");
+    if (entry.conversation_kind.is_none() || main_claim) && record.links.conversation_kind.is_some()
+    {
+        entry.conversation_kind = record.links.conversation_kind.clone();
+    }
     entry.last_ts = entry.last_ts.max(record.ts);
     if score >= entry.top_score {
         entry.top_score = score;
@@ -5618,13 +5707,13 @@ fn run_search_request(
     } else {
         None
     };
-    // The kind filter runs after retrieval caps the candidate list, so a
-    // filtered subset could starve the result list. Over-fetch while a subset
-    // is selected, then retain and truncate back to the display cap.
-    let query_limit = if matches!(request.kind, crate::analytics::SessionKindFilter::All) {
+    // Over-fetch when an origin filter is active: the kind filter applies
+    // after grouping, so capping the record query at RESULT_LIMIT first
+    // could starve interactive matches in subagent-heavy corpora.
+    let record_limit = if request.kind == crate::analytics::SessionKindFilter::All {
         RESULT_LIMIT
     } else {
-        RESULT_LIMIT.saturating_mul(5)
+        RESULT_LIMIT * 5
     };
     let mut sessions = sessions_from_query(
         index,
@@ -5632,7 +5721,7 @@ fn run_search_request(
         request.source.as_filter(),
         tantivy_project,
         request.since,
-        query_limit,
+        record_limit,
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
@@ -5720,6 +5809,7 @@ fn build_detail_lines_from_records(
             format!("{}:{}", session.machine, session.source.label())
         },
         session_id: session.session_id.clone(),
+        kind: session.conversation_kind.clone(),
     }];
     if records.is_empty() {
         lines.push(PreviewLine::Text("no records in session".to_string()));
@@ -6371,16 +6461,25 @@ fn render_preview_line<'a>(line: &'a PreviewLine, theme: &Theme) -> Line<'a> {
             project,
             source,
             session_id,
-        } => Line::from(vec![
-            Span::styled("project ", theme.muted),
-            Span::styled(project.as_str(), theme.accent),
-            Span::raw("  "),
-            Span::styled("source ", theme.muted),
-            Span::styled(source.as_str(), theme.muted),
-            Span::raw("  "),
-            Span::styled("session ", theme.muted),
-            Span::styled(session_id.as_str(), theme.text),
-        ]),
+            kind,
+        } => {
+            let mut spans = vec![
+                Span::styled("project ", theme.muted),
+                Span::styled(project.as_str(), theme.accent),
+                Span::raw("  "),
+                Span::styled("source ", theme.muted),
+                Span::styled(source.as_str(), theme.muted),
+                Span::raw("  "),
+                Span::styled("session ", theme.muted),
+                Span::styled(session_id.as_str(), theme.text),
+            ];
+            if let Some(kind_str) = kind.as_deref().filter(|s| !s.is_empty()) {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled("origin ", theme.muted));
+                spans.push(Span::styled(kind_str, theme.accent));
+            }
+            Line::from(spans)
+        }
         PreviewLine::Meta {
             role,
             ts,
@@ -6700,6 +6799,8 @@ fn handle_home_mouse(mouse: MouseEvent, terminal: &mut TuiTerminal, app: &mut Ap
                 app.open_home_dropdown(HomeDropdown::Machine);
             } else if app.home_source_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Source);
+            } else if app.home_kind_area.contains(pos) {
+                app.open_home_dropdown(HomeDropdown::Kind);
             } else if app.home_project_area.contains(pos) {
                 app.open_home_dropdown(HomeDropdown::Project);
             } else if app.home_list_area.contains(pos) && app.home_list_area.height > 0 {
@@ -6956,7 +7057,9 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
-    use ratatui::{backend::TestBackend, buffer::Buffer, widgets::Widget};
+    use ratatui::{
+        TerminalOptions, Viewport, backend::TestBackend, buffer::Buffer, widgets::Widget,
+    };
     use std::hint::black_box;
 
     fn create_stale_schema_index(dir: &std::path::Path) {
@@ -7037,6 +7140,23 @@ mod tests {
             links: RecordLinks::default(),
             source_path: "source.jsonl".to_string(),
         }
+    }
+
+    #[test]
+    fn grouped_session_prefers_main_over_side_records() {
+        let mut sessions = std::collections::HashMap::new();
+        let mut side = record("assistant", "sidechain output");
+        side.links.conversation_kind = Some("sidechain".to_string());
+        add_record_to_session(&mut sessions, 1.0, side);
+        let mut main = record("user", "please fix the parser");
+        main.links.conversation_kind = Some("main".to_string());
+        add_record_to_session(&mut sessions, 0.5, main);
+        let summary = sessions.get("session").expect("grouped");
+        assert_eq!(summary.conversation_kind.as_deref(), Some("main"));
+        assert!(session_matches_kind(
+            crate::analytics::SessionKindFilter::Primary,
+            summary.conversation_kind.as_deref()
+        ));
     }
 
     fn markdown_perf_records() -> Vec<Record> {
@@ -7373,6 +7493,7 @@ mod tests {
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
 
         app.source = SourceChoice::All;
+        app.session_kind = crate::analytics::SessionKindFilter::All;
         app.config.machines.push(crate::config::MachineConfig {
             id: "mini".to_string(),
             label: None,
@@ -7384,6 +7505,9 @@ mod tests {
         });
         assert!(!app.home_chart_is_filtered());
         assert_eq!(app.home_chart_activity(), app.home_activity.as_slice());
+
+        app.session_kind = crate::analytics::SessionKindFilter::Primary;
+        assert!(app.home_chart_is_filtered());
     }
 
     #[test]
@@ -7725,6 +7849,85 @@ mod tests {
     }
 
     #[test]
+    fn kind_dropdown_applies_selection() {
+        let (_tmp, mut app) = test_app();
+        // Default filter is primary, which sits at index 1 in all/primary/subagent order.
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
+    fn kind_dropdown_change_reloads_token_chart() {
+        let (_tmp, mut app) = test_app();
+        app.config.token_usage = Some(true);
+        app.home_chart_mode = HomeChartMode::Tokens;
+        app.home_token_activity_state = LoadState::Loaded;
+        // Default filter is primary at index 1 in all/interactive/subagent order.
+        app.open_home_dropdown(HomeDropdown::Kind);
+        app.move_home_dropdown_selection(1);
+        app.apply_home_dropdown();
+        assert_eq!(
+            app.session_kind,
+            crate::analytics::SessionKindFilter::Subagent
+        );
+        // The origin change must kick a token reload, not leave stale totals.
+        assert_eq!(app.home_token_activity_state, LoadState::Loading);
+    }
+
+    #[test]
+    fn kind_dropdown_lists_all_first() {
+        let (_tmp, mut app) = test_app();
+        app.open_home_dropdown(HomeDropdown::Kind);
+        assert_eq!(
+            app.home_dropdown_options(),
+            vec!["all", "interactive", "subagent"]
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn kind_dropdown_k_navigates_instead_of_closing() {
+        let (_tmp, mut app) = test_app();
+        let devnull = std::fs::OpenOptions::new()
+            .write(true)
+            .open("/dev/null")
+            .expect("devnull");
+        // Fixed viewport: `Terminal::new` queries the real terminal size,
+        // which fails without a TTY (sandbox, CI). Key handling never draws.
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(devnull),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("terminal");
+        app.open_home_dropdown(HomeDropdown::Kind);
+        // Default filter is primary at index 1 in all/primary/subagent order.
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        // `j` moves down like in every other dropdown.
+        let key = KeyEvent::new(KeyCode::Char('j'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(2));
+        // `k` moves back up and leaves the dropdown open.
+        let key = KeyEvent::new(KeyCode::Char('k'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::Kind);
+        assert_eq!(app.home_dropdown_state.selected(), Some(1));
+        // `c` toggles the kind dropdown closed.
+        let key = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
+        handle_home_key(key, &mut terminal, &mut app).expect("key");
+        assert_eq!(app.home_dropdown, HomeDropdown::None);
+    }
+
+    #[test]
     fn machine_dropdown_applies_to_search_and_chart_filter() {
         let (_tmp, mut app) = test_app();
         app.home_machines = vec!["local".to_string(), "mini".to_string()];
@@ -7751,7 +7954,7 @@ mod tests {
     }
 
     #[test]
-    fn range_dropdown_changes_chart_without_restarting_search() {
+    fn range_dropdown_filters_list_and_chart() {
         let (_tmp, mut app) = test_app();
         app.active_search_request = 7;
         app.open_home_dropdown(HomeDropdown::Range);
@@ -7760,9 +7963,20 @@ mod tests {
         app.move_home_dropdown_selection(1);
         app.apply_home_dropdown();
 
+        // "All" clears the list's `since` bound and restarts the search.
         assert_eq!(app.home_activity_range, TimelineRange::All);
-        assert_eq!(app.active_search_request, 7);
+        assert_eq!(app.sessions_since, None);
+        assert_ne!(app.active_search_request, 7);
         assert_eq!(app.home_activity_state, LoadState::Loading);
+
+        // A bounded range syncs the list's `since` bound to the same cutoff.
+        app.open_home_dropdown(HomeDropdown::Range);
+        app.move_home_dropdown_selection(-2);
+        app.apply_home_dropdown();
+        assert_eq!(app.home_activity_range, TimelineRange::Week);
+        let since = app.sessions_since.expect("bounded range sets since");
+        let now = now_ms();
+        assert!(since <= now && since > now.saturating_sub(8 * 86_400_000));
     }
 
     #[test]

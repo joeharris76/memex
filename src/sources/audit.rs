@@ -10,6 +10,7 @@ use std::path::PathBuf;
 pub struct SourceAudit {
     pub source: String,
     pub files: u64,
+    pub unreadable_files: u64,
     pub valid_json_lines: u64,
     pub malformed_json_lines: u64,
     pub non_object_json_lines: u64,
@@ -129,7 +130,14 @@ fn audit_files(source: SourceKind, files: &[PathBuf]) -> SourceAudit {
         ..SourceAudit::default()
     };
     for file in files {
+        if source == SourceKind::Hermes {
+            // Hermes usage truth is SQLite aggregate data. Audit must not
+            // reinterpret the database as JSON, and in particular must not
+            // read transcript/message columns: count the file, skip content.
+            continue;
+        }
         let Ok(file) = std::fs::File::open(file) else {
+            audit.unreadable_files += 1;
             continue;
         };
         if source == SourceKind::Hermes {
@@ -392,5 +400,33 @@ mod tests {
 
         let audit = audit_files(SourceKind::Pi, &[path]);
         assert_eq!(audit.producer_versions.get("3"), Some(&1));
+    }
+
+    #[test]
+    fn audit_skips_hermes_database_content() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.db");
+        // SQLite header plus binary pages: must never be line-read.
+        let mut bytes = b"SQLite format 3\0".to_vec();
+        bytes.extend([0x7Fu8; 4096]);
+        bytes.extend(b"{\"type\":\"should_not_parse\"}\n");
+        fs::write(&path, &bytes).unwrap();
+
+        let audit = audit_files(SourceKind::Hermes, &[path]);
+        assert_eq!(audit.files, 1);
+        assert_eq!(audit.valid_json_lines, 0);
+        assert_eq!(audit.malformed_json_lines, 0);
+        assert_eq!(audit.unreadable_files, 0);
+    }
+
+    #[test]
+    fn audit_counts_unreadable_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("gone.jsonl");
+
+        let audit = audit_files(SourceKind::Codex, &[missing]);
+        assert_eq!(audit.files, 1);
+        assert_eq!(audit.unreadable_files, 1);
+        assert_eq!(audit.valid_json_lines, 0);
     }
 }

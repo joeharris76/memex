@@ -246,6 +246,9 @@ OUTPUT FIELDS (--fields):
         /// Filter by source: claude, codex, cursor, opencode, pi, omp (Oh My Pi), openclaw, copilot, grok, hermes, jcode, or muse
         #[arg(long)]
         source: Option<SourceFilter>,
+        /// Filter by session origin: interactive, subagent, or all
+        #[arg(long, value_enum, default_value_t = SessionOrigin::All)]
+        origin: SessionOrigin,
         /// Use semantic (embedding-based) search instead of keyword search
         #[arg(long)]
         semantic: bool,
@@ -453,12 +456,12 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Filter by session kind: primary (interactive), subagent, or all
-        #[arg(long, value_enum, default_value_t = SessionKind::All)]
-        kind: SessionKind,
-        /// Only show primary (interactive) sessions (alias for --kind primary)
-        #[arg(long)]
-        primary_only: bool,
+        /// Filter by session origin: interactive, subagent, or all
+        #[arg(long, value_enum, default_value_t = SessionOrigin::All)]
+        origin: SessionOrigin,
+        /// Only show interactive sessions (alias for --origin interactive)
+        #[arg(long, conflicts_with = "origin")]
+        interactive_only: bool,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
         json_array: bool,
@@ -711,18 +714,18 @@ impl From<TransferMode> for CoreTransferMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 #[value(rename_all = "kebab-case")]
-enum SessionKind {
-    Primary,
+enum SessionOrigin {
+    Interactive,
     Subagent,
     All,
 }
 
-impl From<SessionKind> for crate::analytics::SessionKindFilter {
-    fn from(value: SessionKind) -> Self {
+impl From<SessionOrigin> for crate::analytics::SessionKindFilter {
+    fn from(value: SessionOrigin) -> Self {
         match value {
-            SessionKind::Primary => crate::analytics::SessionKindFilter::Primary,
-            SessionKind::Subagent => crate::analytics::SessionKindFilter::Subagent,
-            SessionKind::All => crate::analytics::SessionKindFilter::All,
+            SessionOrigin::Interactive => crate::analytics::SessionKindFilter::Primary,
+            SessionOrigin::Subagent => crate::analytics::SessionKindFilter::Subagent,
+            SessionOrigin::All => crate::analytics::SessionKindFilter::All,
         }
     }
 }
@@ -896,6 +899,7 @@ pub fn run() -> Result<()> {
             tool,
             session,
             source,
+            origin,
             semantic,
             hybrid,
             min_score,
@@ -923,6 +927,7 @@ pub fn run() -> Result<()> {
                 tool,
                 session,
                 source,
+                origin,
                 semantic,
                 hybrid,
                 min_score,
@@ -1093,17 +1098,17 @@ pub fn run() -> Result<()> {
             source,
             since,
             limit,
-            kind,
-            primary_only,
+            origin,
+            interactive_only,
             json_array,
             root,
         } => {
-            let kind = if primary_only {
-                SessionKind::Primary
+            let origin = if interactive_only {
+                SessionOrigin::Interactive
             } else {
-                kind
+                origin
             };
-            run_sessions(cwd, project, source, since, limit, kind, json_array, root)?;
+            run_sessions(cwd, project, source, since, limit, origin, json_array, root)?;
         }
         Commands::Herdr { action } => match action {
             HerdrCommand::ResumeLast {
@@ -1487,6 +1492,7 @@ fn run_search(
     tool: Option<String>,
     session: Option<String>,
     source: Option<SourceFilter>,
+    origin: SessionOrigin,
     semantic: bool,
     hybrid: bool,
     min_score: Option<f32>,
@@ -1540,6 +1546,7 @@ fn run_search(
     } else {
         top_n_per_session
     };
+    let kind_filter: crate::analytics::SessionKindFilter = origin.into();
     let render = RenderOptions {
         verbose,
         matchers,
@@ -1549,12 +1556,19 @@ fn run_search(
         min_score,
         top_n_per_session,
         limit,
+        kind_filter,
     };
 
-    let candidate_limit = if queries.len() > 1
+    // Origin filtering applies after retrieval, so a fixed overfetch can
+    // still starve when wanted-kind matches rank below the cap. Re-run with
+    // a wider cap (bounded) until the filtered list is full or retrieval
+    // stops offering more candidates.
+    let origin_filtered = kind_filter != crate::analytics::SessionKindFilter::All;
+    let mut candidate_limit = if queries.len() > 1
         || top_n_per_session.is_some()
         || options.source.is_some()
         || cwd.is_some()
+        || origin_filtered
     {
         (limit * 5).max(limit + 10)
     } else {
@@ -1568,49 +1582,63 @@ fn run_search(
         SearchMode::Lexical
     };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
-    let mut ranked_queries = Vec::with_capacity(queries.len());
-    let mut query_candidate_counts = Vec::with_capacity(queries.len());
     let mut failures = Vec::new();
     let mut seen_failures = HashSet::new();
-    for (query_index, query) in queries.iter().enumerate() {
-        let spec = SearchSpec {
-            query: query.clone(),
-            project: options.project.clone(),
-            role: options.role.clone(),
-            tool: options.tool.clone(),
-            session_id: options.session_id.clone(),
-            session_scope: None,
-            cwd: cwd.clone(),
-            source: options.source,
-            since: options.since,
-            until: options.until,
-            limit: candidate_limit,
-            mode,
-            recency_weight,
-            recency_half_life_days,
-            min_score,
-            project_grouping: None,
-        };
-        let federated =
-            federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
-        query_candidate_counts.push(federated.candidate_count);
-        for (machine, error) in federated.failures {
-            let message = format!("{machine}: {error}");
-            if seen_failures.insert(message.clone()) {
-                eprintln!("Warning: machine '{machine}' unavailable: {error}");
-                failures.push(message);
+    let mut ranked_queries;
+    let mut query_candidate_counts;
+    let mut results;
+    let mut round = 0;
+    loop {
+        ranked_queries = Vec::with_capacity(queries.len());
+        query_candidate_counts = Vec::with_capacity(queries.len());
+        let mut round_capped = false;
+        for (query_index, query) in queries.iter().enumerate() {
+            let spec = SearchSpec {
+                query: query.clone(),
+                project: options.project.clone(),
+                role: options.role.clone(),
+                tool: options.tool.clone(),
+                session_id: options.session_id.clone(),
+                session_scope: None,
+                cwd: cwd.clone(),
+                source: options.source,
+                since: options.since,
+                until: options.until,
+                limit: candidate_limit,
+                mode,
+                recency_weight,
+                recency_half_life_days,
+                min_score,
+                project_grouping: None,
+            };
+            let federated =
+                federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
+            round_capped = round_capped || federated.candidate_count > federated.items.len();
+            query_candidate_counts.push(federated.candidate_count);
+            for (machine, error) in federated.failures {
+                let message = format!("{machine}: {error}");
+                if seen_failures.insert(message.clone()) {
+                    eprintln!("Warning: machine '{machine}' unavailable: {error}");
+                    failures.push(message);
+                }
             }
+            ranked_queries.push(federated.items);
         }
-        ranked_queries.push(federated.items);
+        let fused = if ranked_queries.len() == 1 {
+            ranked_queries.pop().unwrap_or_default()
+        } else {
+            fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
+        };
+        let stored_kinds = stored_session_kinds(&paths, &fused, origin_filtered);
+        let mut merged_render = render.clone();
+        merged_render.min_score = None;
+        results = apply_post_processing_located(fused, &merged_render, &stored_kinds);
+        round += 1;
+        if !origin_filtered || results.len() >= render.limit || !round_capped || round >= 3 {
+            break;
+        }
+        candidate_limit = candidate_limit.saturating_mul(5);
     }
-    let mut results = if ranked_queries.len() == 1 {
-        ranked_queries.pop().unwrap_or_default()
-    } else {
-        fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
-    };
-    let mut merged_render = render.clone();
-    merged_render.min_score = None;
-    results = apply_post_processing_located(results, &merged_render);
     if trace {
         let mode_label = match (mode, queries.len() > 1) {
             (SearchMode::Lexical, false) => "lexical",
@@ -1646,6 +1674,7 @@ struct RenderOptions {
     min_score: Option<f32>,
     top_n_per_session: Option<usize>,
     limit: usize,
+    kind_filter: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Serialize)]
@@ -2332,6 +2361,7 @@ fn run_usage(options: UsageCommandOptions) -> Result<()> {
                 cost_mode,
                 include_events,
                 memo_ttl_ms: 0,
+                kind: None,
             },
         )?;
         if json {
@@ -2749,7 +2779,7 @@ fn run_sessions(
     source: Option<SourceFilter>,
     since: Option<String>,
     limit: usize,
-    kind: SessionKind,
+    origin: SessionOrigin,
     json_array: bool,
     root: Option<PathBuf>,
 ) -> Result<()> {
@@ -2758,8 +2788,8 @@ fn run_sessions(
     let store = open_analytics_read_only(&paths)?;
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
-    let kind_filter = match kind {
-        SessionKind::All => None,
+    let kind_filter = match origin {
+        SessionOrigin::All => None,
         other => Some(other.into()),
     };
     let rows = store.query_sessions_detailed_filtered(
@@ -2814,15 +2844,29 @@ fn run_herdr_resume(
 
     let mut rows =
         store.query_sessions_detailed(source, None, cwd_filter.as_deref(), None, None)?;
+    // Resume-last targets the user's own work, never a background worker
+    // transcript. An explicit session id still resumes anything.
+    let interactive = |row: &crate::analytics::SessionDetailRow| {
+        row.conversation_kind
+            .as_deref()
+            .is_none_or(|kind| kind == "main")
+    };
     if let Some(session_id) = &session_id {
         rows.retain(|row| &row.session_id == session_id);
         if rows.is_empty() {
             return Err(anyhow!("session '{session_id}' not found"));
         }
-    } else if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
-        // The public CLI keeps its historical global fallback unless the Herdr plugin
-        // explicitly requires the focused directory to match.
-        rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+    } else {
+        // Implicit resume never selects a background worker: discard
+        // non-interactive rows even when nothing interactive matches, so
+        // selection falls through to the global fallback or reports none.
+        rows.retain(&interactive);
+        if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
+            // The public CLI keeps its historical global fallback unless the Herdr plugin
+            // explicitly requires the focused directory to match.
+            rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
+            rows.retain(&interactive);
+        }
     }
 
     let Some((row, command, cwd)) = rows
@@ -4533,12 +4577,91 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Stored session kinds for the candidate groups, keyed by
+/// (machine, source label, session id) with prefer-main dominance. Remote
+/// machines and sessions missing from the analytics cache simply have no
+/// entry, and grouping falls back to the matched records. Empty unless an
+/// origin filter is active.
+fn stored_session_kinds(
+    paths: &Paths,
+    results: &[LocatedRecord],
+    origin_filtered: bool,
+) -> HashMap<(String, String, String), Option<String>> {
+    let mut out = HashMap::new();
+    if !origin_filtered {
+        return out;
+    }
+    let Ok(store) = open_analytics_read_only(paths) else {
+        return out;
+    };
+    for result in results {
+        let key = (
+            result.machine.clone(),
+            result.record.source.storage_label().to_string(),
+            result.record.session_id.clone(),
+        );
+        let stored = store.session_conversation_kind(
+            result.record.source.storage_label(),
+            &result.record.session_id,
+            &result.record.source_path,
+        );
+        let dominated = stored.as_deref() == Some("main");
+        out.entry(key)
+            .and_modify(|kind: &mut Option<String>| {
+                if dominated {
+                    *kind = Some("main".to_string());
+                }
+            })
+            .or_insert(stored);
+    }
+    out
+}
+
 fn apply_post_processing_located(
     mut results: Vec<LocatedRecord>,
     render: &RenderOptions,
+    stored_kinds: &HashMap<(String, String, String), Option<String>>,
 ) -> Vec<LocatedRecord> {
     if let Some(min_score) = render.min_score {
         results.retain(|result| result.score >= min_score);
+    }
+
+    // Session-grouped origin filter with prefer-main: a sidechain hit inside
+    // a primary session must not hide the session (mirrors the TUI and the
+    // analytics accumulator). Groups resolve against the stored session kind
+    // first — complete-session truth — and only fall back to the matched
+    // records when the analytics cache has no row (remote machines, stale
+    // caches).
+    if render.kind_filter != crate::analytics::SessionKindFilter::All {
+        let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
+        for result in &results {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            let dominated = result.record.links.conversation_kind.as_deref() == Some("main");
+            group_kind
+                .entry(key)
+                .and_modify(|kind| {
+                    if dominated {
+                        *kind = Some("main".to_string());
+                    }
+                })
+                .or_insert_with(|| result.record.links.conversation_kind.clone());
+        }
+        results.retain(|result| {
+            let key = (
+                result.machine.clone(),
+                result.record.source.storage_label().to_string(),
+                result.record.session_id.clone(),
+            );
+            let kind = stored_kinds
+                .get(&key)
+                .and_then(|stored| stored.as_deref())
+                .or_else(|| group_kind.get(&key).and_then(|kind| kind.as_deref()));
+            render.kind_filter.matches_kind(kind)
+        });
     }
 
     match render.sort {
@@ -4889,6 +5012,23 @@ mod tests {
     use crate::test_support::{EnvVarGuard, env_lock};
     use crate::vector::VectorIndex;
     use tempfile::TempDir;
+
+    #[test]
+    fn sessions_interactive_only_conflicts_with_explicit_origin() {
+        assert!(
+            Cli::try_parse_from([
+                "memex",
+                "sessions",
+                "--origin",
+                "subagent",
+                "--interactive-only"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["memex", "sessions", "--interactive-only"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions", "--origin", "subagent"]).is_ok());
+        assert!(Cli::try_parse_from(["memex", "sessions"]).is_ok());
+    }
 
     #[test]
     fn build_index_command_args_preserves_disabled_sources() {

@@ -1,5 +1,9 @@
 use super::{IndexParseOutput, IndexParseState, ParseDiagnostics, ParserVersions, SourceFile};
-use crate::types::{Record, RecordLinks, SourceKind};
+use crate::analytics::sanitize_label;
+use crate::types::{
+    Record, RecordLinks, SourceKind, jcode_text_is_subagent_directive,
+    jcode_tmp_cwd_is_worker_sandbox,
+};
 use crate::usage::{TokenBuckets, UsageEvent};
 use anyhow::Result;
 use simd_json::BorrowedValue;
@@ -11,7 +15,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 1,
-    index: 1,
+    // Bumped for the worker-sandbox cwd rule: forces a full re-parse so
+    // bare-/tmp-cwd sessions reclassify on next index.
+    index: 5,
     usage: 1,
 };
 
@@ -127,6 +133,14 @@ fn timestamp_millis(value: &BorrowedValue<'_>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Resume origin for jcode parses. A session file is rewritten in place as
+/// a single JSON object, so no byte offset can resume mid-file: the parser
+/// always replays from this origin and ingest always pairs jcode with
+/// atomic delete-first reparse (see `prepare_file_task`). The reported
+/// output offset is the file length — a stored change marker, never a seek
+/// position — so `state.offset` is deliberately unread.
+pub(crate) const JCODE_PARSE_ORIGIN: u64 = 0;
+
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
@@ -143,7 +157,7 @@ pub(crate) fn parse_index_records(
     let Ok(value) = simd_json::to_borrowed_value(&mut bytes) else {
         diagnostics.malformed_json_lines += 1;
         return Ok(IndexParseOutput {
-            offset: 0,
+            offset: JCODE_PARSE_ORIGIN,
             turn_id: state.turn_id,
             pending_tool_calls: state.pending_tool_calls,
             session_id: Some(session_id_from_path(path)),
@@ -168,21 +182,25 @@ pub(crate) fn parse_index_records(
         .and_then(|v| v.as_str())
         .unwrap_or("");
 
-    let mut conversation_kind = if parent_session_id.is_some()
-        || working_dir.starts_with("/tmp/")
-        || working_dir.starts_with("/private/tmp/")
-        || working_dir == "/tmp"
-        || working_dir == "/private/tmp"
-    {
-        "subagent"
-    } else {
-        "main"
-    };
-    // Check directives in first user message for subagent hints
+    // A bare /tmp working directory is not evidence on its own — users
+    // legitimately work in /tmp — so the tmp cue needs a worker-sandbox
+    // leaf name (see `crate::types::jcode_tmp_cwd_is_worker_sandbox`).
+    let mut conversation_kind =
+        if parent_session_id.is_some() || jcode_tmp_cwd_is_worker_sandbox(working_dir) {
+            "subagent"
+        } else {
+            "main"
+        };
+    // Check directives in the first real user message for subagent hints.
+    // Jcode sessions open with <system-reminder> preamble messages, so the
+    // spawning directive usually sits in the second or third user message;
+    // preamble-only messages sanitize to empty and are skipped. Patterns
+    // live in `crate::types::jcode_text_is_subagent_directive`, shared with
+    // the analytics `infer_session_kind` backstop.
     if conversation_kind == "main"
         && let Some(messages) = value.get("messages").and_then(|v| v.as_array())
     {
-        for message in messages.iter().take(3) {
+        for message in messages {
             let Some(obj) = message.as_object() else {
                 continue;
             };
@@ -206,13 +224,11 @@ pub(crate) fn parse_index_records(
                     }
                 }
             }
-            let lower = first_text.to_lowercase();
-            if lower.contains("you are a low-effort fact-checker")
-                || lower.contains("role: manager")
-                || lower.contains("you are a subagent")
-            {
+            if sanitize_label(&first_text).is_empty() {
+                continue;
+            }
+            if jcode_text_is_subagent_directive(&first_text.to_lowercase()) {
                 conversation_kind = "subagent";
-                break;
             }
             break;
         }
@@ -333,7 +349,11 @@ pub(crate) fn parse_index_records(
                     }
 
                     let full_text = text_parts.join("\n").trim().to_string();
-                    if !full_text.is_empty() {
+                    // Preamble-only messages (system context wrappers with no
+                    // real content) are dropped: they add no searchable value,
+                    // and a session containing nothing else yields zero
+                    // records, excluding it from the index altogether.
+                    if !sanitize_label(&full_text).is_empty() {
                         emit(Record {
                             source: SourceKind::Jcode,
                             doc_id: next_doc_id.fetch_add(1, Ordering::SeqCst),
@@ -486,6 +506,7 @@ pub(crate) fn parse_index_records(
     }
 
     Ok(IndexParseOutput {
+        // Change marker only: resume always restarts at JCODE_PARSE_ORIGIN.
         offset: bytes_len,
         turn_id,
         pending_tool_calls,
@@ -611,7 +632,7 @@ mod tests {
                 "id": "session_test_123",
                 "parent_id": null,
                 "title": "Test Jcode Session",
-                "working_dir": "/Users/joe/Developer/memex",
+                "working_dir": "/repo/memex",
                 "provider_key": "meta-muse",
                 "model": "muse-spark-1.2-contributor",
                 "messages": [
@@ -689,5 +710,139 @@ mod tests {
             Some("muse-spark-1.2-contributor")
         );
         assert_eq!(events[0].provider.as_deref(), Some("meta-muse"));
+    }
+
+    fn kind_for_user_texts(texts: &[&str]) -> Option<String> {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_probe.json");
+        let messages: Vec<serde_json::Value> = texts
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                serde_json::json!({
+                    "id": format!("m{i:03}"),
+                    "role": "user",
+                    "timestamp": i as u64,
+                    "content": text,
+                })
+            })
+            .collect();
+        let doc = serde_json::json!({
+            "id": "session_probe",
+            "parent_id": null,
+            "working_dir": "/repo/example",
+            "messages": messages,
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let mut kinds = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                kinds.push(rec.links.conversation_kind.clone());
+                Ok(())
+            },
+        )
+        .unwrap();
+        kinds.into_iter().next().flatten()
+    }
+
+    #[test]
+    fn directive_behind_preamble_is_classified_as_subagent() {
+        let kind = kind_for_user_texts(&[
+            "<system-reminder>\n# Session Context\nDate: 2026-09-01\n</system-reminder>",
+            "You are downstream A8-A11 complete workflow mapper for BenchBox (fresh 01:48Z run). Read-only, no repo writes outside /tmp.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn worker_role_directives_are_classified_as_subagent() {
+        let kind = kind_for_user_texts(&[
+            "You are the focused implementation worker for Bossmode task task_f852ab12.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+        let kind = kind_for_user_texts(&[
+            "You are an investigation subagent. In /repo/example, triage the failure.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn fresh_cycle_and_validation_directives_are_subagent() {
+        let kind = kind_for_user_texts(&[
+            "<system-reminder>\n# Session Context\nDate: 2026-09-02\n</system-reminder>",
+            "FRESH 12:38Z definitive \u{2014} supersede wolf 183 authoritative: At live poll 12:38:43Z origin/develop STILL d7d518e. 0 repo writes.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+        let kind = kind_for_user_texts(&[
+            "Deep validation: Orchestration ORIGIN d7d518e STEADY ~255m at 07:50:05Z live triad. Read-only, 0 repo writes outside /tmp.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn preamble_only_session_yields_no_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session_empty.json");
+        let doc = serde_json::json!({
+            "id": "session_empty",
+            "parent_id": null,
+            "working_dir": "/repo/example",
+            "messages": [
+                {"id": "m001", "role": "user", "timestamp": 1,
+                 "content": "<system-reminder>\n# Session Context\nDate: 2026-09-02\n</system-reminder>"},
+            ],
+        });
+        std::fs::write(&path, serde_json::to_string(&doc).unwrap()).unwrap();
+        let mut records = Vec::new();
+        let next_doc_id = AtomicU64::new(1);
+        parse_index_records(
+            &path,
+            IndexParseState::default(),
+            true,
+            &next_doc_id,
+            |rec| {
+                records.push(rec);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert!(records.is_empty());
+    }
+
+    #[test]
+    fn ordinary_prompts_with_worker_words_stay_main() {
+        // Adversarial negatives: each contains a bare worker-vocabulary
+        // word, but none in the role-assignment or constraint forms the
+        // classifier requires.
+        for text in [
+            "Add a `role: manager` column to the users table and backfill it.",
+            "Please review the implementation worker pool sizing in src/pool.rs",
+            "Our CI policy says 0 repo writes from forks - document that in CONTRIBUTING.md",
+        ] {
+            assert_eq!(
+                kind_for_user_texts(&[text]),
+                Some("main".to_string()),
+                "should stay main: {text}"
+            );
+        }
+    }
+
+    #[test]
+    fn interactive_prompts_stay_main() {
+        // Handoff continuations and read-only reviews are routinely issued
+        // interactively; they must not match the worker-role patterns.
+        let kind = kind_for_user_texts(&[
+            "take over and fully complete all work from the interrupted session `muse resume abc123`",
+        ]);
+        assert_eq!(kind.as_deref(), Some("main"));
+        let kind = kind_for_user_texts(&[
+            "Perform a final independent read-only pre-publication review of release 0.4.0.",
+        ]);
+        assert_eq!(kind.as_deref(), Some("main"));
     }
 }

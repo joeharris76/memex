@@ -18,7 +18,9 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 3,
+    // Bumped for the agent-file backfill mirror: forces a full re-parse
+    // so unlabeled agent-*.jsonl transcripts reclassify on next index.
+    index: 4,
     usage: 4,
 };
 
@@ -93,6 +95,10 @@ pub fn discover(root: &Path, include_agents: bool) -> Result<Vec<SourceFile>> {
         if under_subagents && (!include_agents || !is_agent) {
             continue;
         }
+        // Standard sessions live at most two levels below root
+        // (`<project>/<session>.jsonl`); only agent transcripts nest
+        // deeper, under a `subagents/` directory (see `is_subagent_path`).
+        // Anything deeper outside `subagents/` is not a session file.
         let relative_depth = entry
             .path()
             .strip_prefix(root)
