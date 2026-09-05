@@ -7057,7 +7057,9 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
 mod tests {
     use super::*;
     use crate::types::{RecordLinks, SourceKind};
-    use ratatui::{backend::TestBackend, buffer::Buffer, widgets::Widget};
+    use ratatui::{
+        TerminalOptions, Viewport, backend::TestBackend, buffer::Buffer, widgets::Widget,
+    };
     use std::hint::black_box;
 
     fn create_stale_schema_index(dir: &std::path::Path) {
@@ -7897,7 +7899,15 @@ mod tests {
             .write(true)
             .open("/dev/null")
             .expect("devnull");
-        let mut terminal = Terminal::new(CrosstermBackend::new(devnull)).expect("terminal");
+        // Fixed viewport: `Terminal::new` queries the real terminal size,
+        // which fails without a TTY (sandbox, CI). Key handling never draws.
+        let mut terminal = Terminal::with_options(
+            CrosstermBackend::new(devnull),
+            TerminalOptions {
+                viewport: Viewport::Fixed(Rect::new(0, 0, 80, 24)),
+            },
+        )
+        .expect("terminal");
         app.open_home_dropdown(HomeDropdown::Kind);
         // Default filter is primary at index 1 in all/primary/subagent order.
         assert_eq!(app.home_dropdown_state.selected(), Some(1));
