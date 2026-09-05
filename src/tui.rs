@@ -27,7 +27,6 @@ use ratatui::widgets::{Block, Clear, List, ListItem, ListState, Paragraph, Wrap}
 use serde::Deserialize;
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
-use std::io::BufRead;
 #[cfg(not(unix))]
 use std::io::Stdout;
 use std::io::Write;
@@ -574,6 +573,7 @@ struct SessionSummary {
     snippet: String,
     source_path: String,
     source_dir: String,
+    cwd: Option<String>,
     label: Option<String>,
     conversation_kind: Option<String>,
 }
@@ -2690,11 +2690,17 @@ impl App {
             )
             .ok()
             .and_then(|context| context.cwd)
+            .filter(|c| !crate::resume::is_internal_storage_dir(c))
         } else {
-            resolve_session_cwd(&session)
+            resolve_session_cwd(&self.paths, &session)
+        };
+        let requires_cwd = crate::resume::template_requires_cwd(&template);
+        if requires_cwd && cwd.is_none() {
+            self.set_status("cannot resume: session working directory not found");
+            return Ok(());
         }
-        .unwrap_or_else(|| session.source_dir.clone());
-        let local_command = expand_resume_template(&template, &session, &cwd);
+        let cwd_str = cwd.as_deref().unwrap_or("");
+        let local_command = expand_resume_template(&template, &session, cwd_str);
         let command = if remote {
             let machine = machine_by_id(&self.config, &session.machine)
                 .ok_or_else(|| anyhow::anyhow!("unknown machine '{}'", session.machine))?;
@@ -2707,7 +2713,7 @@ impl App {
         if crate::herdr::inside_herdr() {
             let placement = crate::herdr::resume_placement(&self.config);
             if placement != crate::herdr::ResumePlacement::Off {
-                let herdr_cwd = (!remote).then_some(cwd.as_str());
+                let herdr_cwd = (!remote).then_some(cwd.as_deref()).flatten();
                 match crate::herdr::open_resume_pane(
                     placement,
                     herdr_cwd,
@@ -5471,10 +5477,10 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         top_score: 0.0,
         title: String::new(),
         snippet: String::new(),
-        source_dir: row
+        source_dir: parent_dir(&row.source_path),
+        cwd: row
             .cwd
-            .clone()
-            .unwrap_or_else(|| parent_dir(&row.source_path)),
+            .filter(|c| !crate::resume::is_internal_storage_dir(c)),
         source_path: row.source_path,
         label: row.label,
         conversation_kind: row.conversation_kind,
@@ -5528,12 +5534,35 @@ fn enrich_session_projects(
     sessions: &mut [SessionSummary],
     grouping: ProjectGrouping,
 ) {
-    if grouping == ProjectGrouping::Flat {
-        return;
-    }
     let Ok(store) = AnalyticsStore::open_read_only(analytics_path(&paths.state)) else {
         return;
     };
+    let missing_cwd: Vec<_> = sessions
+        .iter()
+        .filter(|s| s.cwd.is_none())
+        .map(|s| (s.source, s.session_id.clone(), s.source_path.clone()))
+        .collect();
+    if !missing_cwd.is_empty()
+        && let Ok(cwds) = store.query_session_cwds(&missing_cwd)
+    {
+        for session in sessions.iter_mut() {
+            if session.cwd.is_none() {
+                let key = (
+                    session.source,
+                    session.session_id.clone(),
+                    session.source_path.clone(),
+                );
+                if let Some(cwd) = cwds.get(&key)
+                    && !crate::resume::is_internal_storage_dir(cwd)
+                {
+                    session.cwd = Some(cwd.clone());
+                }
+            }
+        }
+    }
+    if grouping == ProjectGrouping::Flat {
+        return;
+    }
     let keys: Vec<_> = sessions
         .iter()
         .map(|session| {
@@ -5685,6 +5714,7 @@ fn add_record_to_session(
             snippet: crate::cli::match_preview(&record.text, matchers, 160),
             source_path: record.source_path.clone(),
             source_dir: parent_dir(&record.source_path),
+            cwd: None,
             label: None,
             conversation_kind: label.clone(),
         });
@@ -5738,6 +5768,7 @@ fn add_located_record_to_session(
         snippet: crate::cli::match_preview(&record.text, matchers, 160),
         source_path: record.source_path.clone(),
         source_dir: parent_dir(&record.source_path),
+        cwd: None,
         label: None,
         conversation_kind: record.links.conversation_kind.clone(),
     });
@@ -6809,65 +6840,45 @@ fn parent_dir(path: &str) -> String {
         .unwrap_or_default()
 }
 
-fn resolve_session_cwd(session: &SessionSummary) -> Option<String> {
-    if session.source == SourceKind::Copilot
-        && let Some(cwd) = resolve_copilot_workspace_cwd(session)
+fn resolve_session_cwd(paths: &Paths, session: &SessionSummary) -> Option<String> {
+    if let Some(ref cwd) = session.cwd
+        && !cwd.is_empty()
+        && !crate::resume::is_internal_storage_dir(cwd)
+    {
+        return Some(cwd.clone());
+    }
+    let db = analytics_path(&paths.state);
+    if db.exists()
+        && let Ok(store) = AnalyticsStore::open_read_only(&db)
+        && let Ok(Some(cwd)) = store.query_session_cwd(
+            session.source,
+            &session.session_id,
+            Some(&session.source_path),
+        )
+        && !cwd.is_empty()
+        && !crate::resume::is_internal_storage_dir(&cwd)
     {
         return Some(cwd);
     }
-    let file = std::fs::File::open(&session.source_path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback: Option<String> = None;
-    for line in reader.lines().map_while(Result::ok) {
-        let value: serde_json::Value = match serde_json::from_str(&line) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string());
-        if fallback.is_none() {
-            fallback = cwd.clone();
-        }
-
-        let session_id_match = value
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .or_else(|| value.get("session_id").and_then(|v| v.as_str()))
-            .map(|s| s == session.session_id)
-            .unwrap_or(false);
-
-        if session_id_match && cwd.is_some() {
-            return cwd;
-        }
-
-        if session.source == SourceKind::Codex
-            && value.get("type").and_then(|v| v.as_str()) == Some("session_meta")
+    if let Some(cwd) = crate::analytics::resolve_session_cwd_standalone(
+        session.source,
+        &session.source_path,
+        &session.session_id,
+    ) && !cwd.is_empty()
+        && !crate::resume::is_internal_storage_dir(&cwd)
+    {
+        return Some(cwd);
+    }
+    if !session.project.is_empty() {
+        let proj_path = std::path::Path::new(&session.project);
+        if proj_path.is_absolute()
+            && proj_path.is_dir()
+            && !crate::resume::is_internal_storage_dir(&session.project)
         {
-            let payload_cwd = value
-                .get("payload")
-                .and_then(|v| v.get("cwd"))
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if payload_cwd.is_some() {
-                return payload_cwd;
-            }
-        }
-
-        if session.source == SourceKind::Pi
-            && value.get("type").and_then(|v| v.as_str()) == Some("session")
-        {
-            let cwd = value
-                .get("cwd")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            if cwd.is_some() {
-                return cwd;
-            }
+            return Some(session.project.clone());
         }
     }
-    fallback
+    None
 }
 fn collect_projects(index: &SearchIndex, source: Option<SourceFilter>) -> Result<Vec<String>> {
     let mut set = HashSet::new();
@@ -7251,51 +7262,6 @@ fn list_index_from_mouse(pos: ratatui::layout::Position, area: Rect, len: usize)
     }
     let row = (pos.y - area.y) as usize;
     if row < len { Some(row) } else { None }
-}
-
-#[derive(Default)]
-struct CopilotWorkspaceCwd {
-    cwd: Option<String>,
-    git_root: Option<String>,
-}
-
-fn resolve_copilot_workspace_cwd(session: &SessionSummary) -> Option<String> {
-    let workspace_path = std::path::Path::new(&session.source_path)
-        .parent()?
-        .join("workspace.yaml");
-    let contents = std::fs::read_to_string(workspace_path).ok()?;
-    let workspace = parse_copilot_workspace_cwd(&contents);
-    workspace.cwd.or(workspace.git_root)
-}
-
-fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
-    let mut workspace = CopilotWorkspaceCwd::default();
-    for line in contents.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty()
-            || trimmed.starts_with('#')
-            || line.chars().next().is_some_and(|c| c.is_whitespace())
-        {
-            continue;
-        }
-        let Some((key, value)) = trimmed.split_once(':') else {
-            continue;
-        };
-        let value = value
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .to_string();
-        if value.is_empty() {
-            continue;
-        }
-        match key.trim() {
-            "cwd" => workspace.cwd = Some(value),
-            "gitRoot" | "git_root" => workspace.git_root = Some(value),
-            _ => {}
-        }
-    }
-    workspace
 }
 
 #[cfg(test)]
@@ -7704,6 +7670,7 @@ mod tests {
             session_id: "01a00000-0000-0000-0000-000000000000".to_string(),
             project: "memex".to_string(),
             source: SourceKind::Codex,
+            cwd: None,
             last_ts: 1,
             hit_count: 1,
             top_score: 0.0,
@@ -7741,6 +7708,7 @@ mod tests {
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
+            cwd: None,
             label: None,
             conversation_kind: None,
         });
@@ -7894,6 +7862,7 @@ mod tests {
                 snippet: String::new(),
                 source_path: "source.jsonl".to_string(),
                 source_dir: String::new(),
+                cwd: None,
                 label: None,
                 conversation_kind: None,
             }],
@@ -8081,6 +8050,7 @@ mod tests {
                 snippet: String::new(),
                 source_path: "codex.jsonl".into(),
                 source_dir: String::new(),
+                cwd: None,
                 label: None,
                 conversation_kind: None,
             },
@@ -8096,6 +8066,7 @@ mod tests {
                 snippet: String::new(),
                 source_path: "claude.jsonl".into(),
                 source_dir: String::new(),
+                cwd: None,
                 label: None,
                 conversation_kind: None,
             },
@@ -8111,6 +8082,7 @@ mod tests {
                 snippet: String::new(),
                 source_path: "remote-codex.jsonl".into(),
                 source_dir: String::new(),
+                cwd: None,
                 label: None,
                 conversation_kind: None,
             },
@@ -9038,6 +9010,7 @@ mod tests {
             top_score: 1.0,
             snippet: String::new(),
             source_dir: "/tmp".to_string(),
+            cwd: None,
             source_path: "source.jsonl".to_string(),
             label: None,
             conversation_kind: None,
@@ -9164,5 +9137,67 @@ mod tests {
         let mut projects = multiple.expect("expanded projects");
         projects.sort();
         assert_eq!(projects, vec!["memex_repo", "memex_repo.wt-feat"]);
+    }
+
+    #[test]
+    fn resolve_session_cwd_rejects_internal_session_storage_and_queries_analytics() {
+        let (tmp, app) = test_app();
+        let db = crate::analytics::analytics_path(&app.paths.state);
+        let mut writer = crate::analytics::AnalyticsWriter::open(&db).expect("open writer");
+
+        let transcript = tmp.path().join("session.jsonl");
+        std::fs::write(&transcript, "").expect("write");
+
+        let r = crate::types::Record {
+            source: SourceKind::Muse,
+            doc_id: 1,
+            ts: 100,
+            project: "obento".to_string(),
+            session_id: "e89a358e".to_string(),
+            turn_id: 1,
+            role: "user".to_string(),
+            text: "test".to_string(),
+            tool_name: None,
+            tool_input: None,
+            tool_output: None,
+            links: Default::default(),
+            source_path: transcript.to_string_lossy().to_string(),
+        };
+        writer.record(&r).expect("record");
+        writer.flush().expect("flush");
+
+        let conn = rusqlite::Connection::open(&db).expect("open conn");
+        conn.execute(
+            "UPDATE sessions SET cwd = '/Users/joe/Developer/obento' WHERE session_id = 'e89a358e'",
+            [],
+        )
+        .expect("update");
+
+        // Case 1: Session has deep internal storage folder in session.cwd
+        let session_with_internal = SessionSummary {
+            machine: LOCAL_MACHINE_ID.to_string(),
+            session_id: "e89a358e".to_string(),
+            project: "obento".to_string(),
+            source: SourceKind::Muse,
+            title: String::new(),
+            last_ts: 100,
+            hit_count: 1,
+            top_score: 1.0,
+            snippet: String::new(),
+            source_path: transcript.to_string_lossy().to_string(),
+            source_dir: "/Users/joe/.local/share/muse/sessions/2026/08/08/e89a358e".to_string(),
+            cwd: Some("/Users/joe/.local/share/muse/sessions/2026/08/08/e89a358e".to_string()),
+            label: None,
+            conversation_kind: None,
+        };
+        // resolve_session_cwd must reject the internal directory and fall back to AnalyticsStore!
+        let resolved = resolve_session_cwd(&app.paths, &session_with_internal);
+        assert_eq!(resolved.as_deref(), Some("/Users/joe/Developer/obento"));
+
+        // Case 2: Session has cwd: None (e.g. from SearchIndex hit)
+        let mut session_no_cwd = session_with_internal.clone();
+        session_no_cwd.cwd = None;
+        let resolved2 = resolve_session_cwd(&app.paths, &session_no_cwd);
+        assert_eq!(resolved2.as_deref(), Some("/Users/joe/Developer/obento"));
     }
 }

@@ -93,17 +93,40 @@ pub fn cwd_from_muse_session(path: &Path) -> Option<PathBuf> {
         {
             if let Some(cwd) = record.get("cwd").and_then(|v| v.as_str())
                 && !cwd.is_empty()
+                && !crate::resume::is_internal_storage_dir(cwd)
             {
                 return Some(PathBuf::from(cwd));
             }
             if let Some(root) = record.get("workspace_root").and_then(|v| v.as_str())
                 && !root.is_empty()
+                && !crate::resume::is_internal_storage_dir(root)
             {
                 return Some(PathBuf::from(root));
             }
         }
         if start > 64 * 1024 {
             break;
+        }
+    }
+    // Subagent sessions (.../<parent>/subagent*/<child>/session.jsonl) do not carry
+    // workspace metadata directly; inherit from the parent session if present.
+    let path_str = path.to_string_lossy().replace('\\', "/");
+    let is_subagent = Path::new(&path_str)
+        .components()
+        .any(|c| c.as_os_str().to_string_lossy().starts_with("subagent"));
+    if is_subagent
+        && let Some(parent_dir) = path
+            .parent()
+            .and_then(|p| p.parent())
+            .and_then(|p| p.parent())
+    {
+        let parent_file = parent_dir.join("session.jsonl");
+        if parent_file.exists()
+            && parent_file != path
+            && let Some(cwd) = cwd_from_muse_session(&parent_file)
+            && !crate::resume::is_internal_storage_dir(&cwd.to_string_lossy())
+        {
+            return Some(cwd);
         }
     }
     None
@@ -808,5 +831,39 @@ mod tests {
             Some("22fe4437-parent")
         );
         assert_eq!(records[0].links.thread_source.as_deref(), Some("subagent"));
+    }
+
+    #[test]
+    fn subagent_inherits_parent_workspace_cwd() {
+        let temp = tempfile::tempdir().unwrap();
+        let parent_dir = temp.path().join("22fe4437-parent");
+        let parent_file = parent_dir.join("session.jsonl");
+        std::fs::create_dir_all(&parent_dir).unwrap();
+        std::fs::write(
+            &parent_file,
+            concat!(
+                r#"{"stream":{"kind":"session","id":"22fe4437-parent"},"recorded_at":1788308372000000,"payload":{"kind":"metadata","record":{"workspace_root":"/repo/parent-project","provider_id":"meta","model_id":"muse-spark-1.2"}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let sub_path = parent_dir
+            .join("subagent")
+            .join("child-123")
+            .join("session.jsonl");
+        std::fs::create_dir_all(sub_path.parent().unwrap()).unwrap();
+        // Child transcript contains NO workspace metadata
+        std::fs::write(
+            &sub_path,
+            concat!(
+                r#"{"stream":{"kind":"session","id":"child-123"},"recorded_at":1788308372900000,"payload":{"kind":"run","event":{"kind":"started","prompt":"Subagent task"}}}"#,
+                "\n"
+            ),
+        )
+        .unwrap();
+
+        let resolved = cwd_from_muse_session(&sub_path);
+        assert_eq!(resolved, Some(PathBuf::from("/repo/parent-project")));
     }
 }

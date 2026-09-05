@@ -12,7 +12,7 @@ use crate::retrieval::{
     ContextOptions, ContextRelation, ContextResult, ContextSelector, canonical_record_id,
     context_records, resolve_record,
 };
-use crate::types::{Record, SourceFilter};
+use crate::types::{Record, SourceFilter, SourceKind};
 use crate::usage::{
     CacheWaste, CostMode, UsageQuery, UsageSummary, scan_usage, scan_usage_activity,
 };
@@ -824,9 +824,14 @@ pub fn session_context(
 ) -> Result<SessionContext> {
     if machine_id == LOCAL_MACHINE_ID {
         let index = SearchIndex::open_or_create(&paths.index)?;
+        let records = records_for_session(&index, session_id, source_path)?;
+        let source = records
+            .first()
+            .map(|r| r.source)
+            .unwrap_or_else(|| SourceKind::from_path(source_path));
         return Ok(SessionContext {
-            records: records_for_session(&index, session_id, source_path)?,
-            cwd: discover_cwd(std::path::Path::new(source_path), session_id),
+            cwd: discover_cwd(std::path::Path::new(source_path), session_id, source),
+            records,
         });
     }
     let machine = config
@@ -1173,14 +1178,19 @@ fn session_page_context_local(
     let (records, total) = records_for_session_page(&index, request)?;
     let next_offset = (request.offset.saturating_add(records.len()) < total)
         .then_some(request.offset.saturating_add(records.len()));
+    let source = records
+        .first()
+        .map(|r| r.source)
+        .unwrap_or_else(|| SourceKind::from_path(&request.source_path));
     Ok(SessionPageContext {
         session_id: request.session_id.clone(),
         source_path: request.source_path.clone(),
-        records,
         cwd: discover_cwd(
             std::path::Path::new(&request.source_path),
             &request.session_id,
+            source,
         ),
+        records,
         offset: request.offset,
         total,
         next_offset,
@@ -1983,10 +1993,14 @@ fn handle_rpc(paths: &Paths, config: &UserConfig, request: RpcOperation) -> Resu
         } => {
             let index = SearchIndex::open_or_create(&paths.index)?;
             let records = records_for_session(&index, &session_id, &source_path)?;
+            let source = records
+                .first()
+                .map(|r| r.source)
+                .unwrap_or_else(|| SourceKind::from_path(&source_path));
             Ok(RpcPayload::Session {
                 context: SessionContext {
                     records,
-                    cwd: discover_cwd(std::path::Path::new(&source_path), &session_id),
+                    cwd: discover_cwd(std::path::Path::new(&source_path), &session_id, source),
                 },
             })
         }
@@ -2629,42 +2643,10 @@ fn records_for_session_page(
     )
 }
 
-fn discover_cwd(path: &std::path::Path, session_id: &str) -> Option<String> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let mut fallback = None;
-    for line in std::io::BufRead::lines(reader).map_while(Result::ok) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
-            continue;
-        };
-        let cwd = value
-            .get("cwd")
-            .and_then(|value| value.as_str())
-            .or_else(|| {
-                value
-                    .get("payload")
-                    .and_then(|payload| payload.get("cwd"))
-                    .and_then(|value| value.as_str())
-            })
-            .map(str::to_string);
-        if fallback.is_none() {
-            fallback.clone_from(&cwd);
-        }
-        let matches_session = value
-            .get("sessionId")
-            .and_then(|value| value.as_str())
-            .or_else(|| value.get("session_id").and_then(|value| value.as_str()))
-            .is_some_and(|id| id == session_id);
-        if matches_session && cwd.is_some() {
-            return cwd;
-        }
-        if value.get("type").and_then(|value| value.as_str()) == Some("session_meta")
-            && cwd.is_some()
-        {
-            return cwd;
-        }
-    }
-    fallback
+fn discover_cwd(path: &std::path::Path, session_id: &str, source: SourceKind) -> Option<String> {
+    let path_str = path.to_string_lossy();
+    crate::analytics::resolve_session_cwd_standalone(source, &path_str, session_id)
+        .filter(|cwd| !crate::resume::is_internal_storage_dir(cwd))
 }
 
 fn rpc_records(

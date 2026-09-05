@@ -4803,10 +4803,28 @@ fn source_dir_of(source_path: &str) -> String {
 fn session_resume_command(
     config: &UserConfig,
     row: &crate::analytics::SessionDetailRow,
-) -> Option<(String, String)> {
+    resolve_disk: bool,
+) -> Option<(String, Option<String>)> {
     let template = crate::resume::resume_template(config, row.source, false)?;
     let source_dir = source_dir_of(&row.source_path);
-    let cwd = row.cwd.clone().unwrap_or_else(|| source_dir.clone());
+    let mut cwd = row
+        .cwd
+        .as_deref()
+        .filter(|c| !crate::resume::is_internal_storage_dir(c))
+        .map(String::from);
+    if cwd.is_none() && resolve_disk {
+        cwd = crate::analytics::resolve_session_cwd_standalone(
+            row.source,
+            &row.source_path,
+            &row.session_id,
+        )
+        .filter(|c| !crate::resume::is_internal_storage_dir(c));
+    }
+    let requires_cwd = crate::resume::template_requires_cwd(&template);
+    if requires_cwd && cwd.is_none() {
+        return None;
+    }
+    let effective_cwd = cwd.as_deref().unwrap_or("");
     let command = crate::resume::expand_resume_template(
         &template,
         &crate::resume::ResumeSession {
@@ -4816,7 +4834,7 @@ fn session_resume_command(
             source_path: &row.source_path,
             source_dir: &source_dir,
         },
-        &cwd,
+        effective_cwd,
     );
     Some((command, cwd))
 }
@@ -4921,7 +4939,7 @@ pub(crate) fn collect_sessions(
 
     let mut items = Vec::new();
     for row in &rows {
-        let resume_cmd = session_resume_command(&config, row).map(|(command, _)| command);
+        let resume_cmd = session_resume_command(&config, row, false).map(|(command, _)| command);
         let mut value = serde_json::to_value(row)?;
         let object = value
             .as_object_mut()
@@ -5092,10 +5110,9 @@ fn run_herdr_resume(
         }
     }
 
-    let Some((row, command, cwd)) = rows
-        .iter()
-        .find_map(|row| session_resume_command(&config, row).map(|(cmd, cwd)| (row, cmd, cwd)))
-    else {
+    let Some((row, command, cwd)) = rows.iter().find_map(|row| {
+        session_resume_command(&config, row, true).map(|(cmd, cwd)| (row, cmd, cwd))
+    }) else {
         return Err(anyhow!("no resumable session found"));
     };
 
@@ -5108,8 +5125,7 @@ fn run_herdr_resume(
             .repo_project
             .clone()
             .unwrap_or_else(|| row.project.clone());
-        let pane_id =
-            crate::herdr::open_resume_pane(placement, Some(cwd.as_str()), &label, &command)?;
+        let pane_id = crate::herdr::open_resume_pane(placement, cwd.as_deref(), &label, &command)?;
         println!(
             "resumed {} ({}) in herdr pane {pane_id}",
             row.session_id,

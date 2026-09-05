@@ -998,6 +998,97 @@ impl AnalyticsStore {
         }
         Ok(projects)
     }
+
+    pub fn query_session_cwd(
+        &self,
+        source: SourceKind,
+        session_id: &str,
+        source_path: Option<&str>,
+    ) -> Result<Option<String>> {
+        if let Some(path) = source_path {
+            let cwd: Option<Option<String>> = self
+                .conn
+                .query_row(
+                    "SELECT COALESCE(NULLIF(cwd, ''), NULLIF(git_root, ''))
+                     FROM sessions
+                     WHERE source = ?1 AND session_id = ?2 AND source_path = ?3",
+                    params![source.storage_label(), session_id, path],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            return Ok(cwd.flatten().filter(|s| !s.is_empty()));
+        }
+        // If source_path was not provided, query all distinct non-empty cwds for this (source, session_id).
+        // If exactly 1 distinct cwd exists, return it. If multiple distinct cwds exist,
+        // it is ambiguous across multiple worktrees/paths, so reject.
+        let mut stmt = self.conn.prepare(
+            "SELECT DISTINCT COALESCE(NULLIF(cwd, ''), NULLIF(git_root, '')) AS effective_cwd
+             FROM sessions
+             WHERE source = ?1 AND session_id = ?2
+               AND ((cwd IS NOT NULL AND cwd != '') OR (git_root IS NOT NULL AND git_root != ''))",
+        )?;
+        let mut rows = stmt.query(params![source.storage_label(), session_id])?;
+        let mut found_cwd: Option<String> = None;
+        while let Some(row) = rows.next()? {
+            let cwd: Option<String> = row.get(0)?;
+            if let Some(c) = cwd.filter(|s| !s.is_empty()) {
+                if found_cwd.is_some() {
+                    // Ambiguous: multiple distinct cwds for this session_id across different paths!
+                    return Ok(None);
+                }
+                found_cwd = Some(c);
+            }
+        }
+        Ok(found_cwd)
+    }
+
+    pub fn query_session_cwds(
+        &self,
+        sessions: &[(SourceKind, String, String)],
+    ) -> Result<HashMap<(SourceKind, String, String), String>> {
+        if sessions.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let mut cwds = HashMap::new();
+        // Chunk in batches of 100 to stay well under SQLite's 999 parameter limit
+        for chunk in sessions.chunks(100) {
+            let conditions = std::iter::repeat_n(
+                "(source = ? AND session_id = ? AND source_path = ?)",
+                chunk.len(),
+            )
+            .collect::<Vec<_>>()
+            .join(" OR ");
+            let mut stmt = self.conn.prepare(&format!(
+                "SELECT source, session_id, source_path, COALESCE(NULLIF(cwd, ''), NULLIF(git_root, ''))
+                 FROM sessions WHERE {conditions}"
+            ))?;
+            let values = chunk.iter().flat_map(|(source, session_id, source_path)| {
+                [
+                    rusqlite::types::Value::Text(source.storage_label().to_string()),
+                    rusqlite::types::Value::Text(session_id.clone()),
+                    rusqlite::types::Value::Text(source_path.clone()),
+                ]
+            });
+            let rows = stmt.query_map(params_from_iter(values), |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                ))
+            })?;
+            for row in rows {
+                let (source, session_id, source_path, cwd) = row?;
+                let Some(source) = SourceKind::from_label(&source) else {
+                    continue;
+                };
+                if let Some(cwd) = cwd.filter(|s| !s.is_empty()) {
+                    cwds.insert((source, session_id, source_path), cwd);
+                }
+            }
+        }
+        Ok(cwds)
+    }
 }
 
 impl AnalyticsWriter {
@@ -1819,6 +1910,19 @@ fn path_file_name(path: &str) -> Option<String> {
         .and_then(|n| n.to_str())
         .filter(|name| !name.is_empty())
         .map(|name| name.to_string())
+}
+
+pub fn resolve_session_cwd_standalone(
+    source: SourceKind,
+    source_path: &str,
+    session_id: &str,
+) -> Option<String> {
+    resolve_session_cwd_from_parts(
+        source,
+        source_path,
+        session_id,
+        &mut OpencodeLookupCache::default(),
+    )
 }
 
 fn resolve_session_cwd_from_parts(
@@ -3629,6 +3733,98 @@ mod tests {
             &mut OpencodeLookupCache::default(),
         );
         assert_eq!(cwd.as_deref(), Some("/repo/example"));
+
+        let standalone =
+            resolve_session_cwd_standalone(SourceKind::Jcode, &path.to_string_lossy(), "s-cwd");
+        assert_eq!(standalone.as_deref(), Some("/repo/example"));
+    }
+
+    #[test]
+    fn analytics_query_session_cwd_and_cwds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let db = tmp.path().join("analytics.sqlite");
+        let a_path = tmp.path().join("a.jsonl");
+        let b_path = tmp.path().join("b.jsonl");
+        fs::write(&a_path, "").expect("write");
+        fs::write(&b_path, "").expect("write");
+
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut rec = record("proj", "s-1", &a_path, 10);
+        rec.source = SourceKind::Muse;
+        rec.role = "user".to_string();
+        rec.text = "test query cwd".to_string();
+        writer.record(&rec).expect("record");
+
+        // s-2 has NULL cwd and git_root
+        let mut rec2 = record("proj", "s-2", &b_path, 20);
+        rec2.source = SourceKind::Muse;
+        rec2.role = "user".to_string();
+        rec2.text = "test null cwd".to_string();
+        writer.record(&rec2).expect("record");
+        writer.flush().expect("flush");
+
+        // Manually update cwd for s-1
+        let conn = rusqlite::Connection::open(&db).expect("open");
+        conn.execute(
+            "UPDATE sessions SET cwd = '/repo/custom-workspace' WHERE session_id = 's-1'",
+            [],
+        )
+        .expect("update");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open store");
+        let cwd = store
+            .query_session_cwd(SourceKind::Muse, "s-1", Some(&a_path.to_string_lossy()))
+            .expect("query_session_cwd");
+        assert_eq!(cwd.as_deref(), Some("/repo/custom-workspace"));
+
+        // NULL cwd and NULL git_root must return Ok(None) without rusqlite type conversion error
+        let null_cwd = store
+            .query_session_cwd(SourceKind::Muse, "s-2", Some(&b_path.to_string_lossy()))
+            .expect("query_session_cwd null");
+        assert_eq!(null_cwd, None);
+
+        // Test chunking with >100 entries
+        let mut batch = Vec::new();
+        for i in 0..150 {
+            batch.push((
+                SourceKind::Muse,
+                format!("s-batch-{i}"),
+                format!("/fake/path/{i}.jsonl"),
+            ));
+        }
+        batch.push((
+            SourceKind::Muse,
+            "s-1".to_string(),
+            a_path.to_string_lossy().to_string(),
+        ));
+        let cwds = store
+            .query_session_cwds(&batch)
+            .expect("query_session_cwds");
+        assert_eq!(
+            cwds.get(&(
+                SourceKind::Muse,
+                "s-1".to_string(),
+                a_path.to_string_lossy().to_string()
+            ))
+            .map(String::as_str),
+            Some("/repo/custom-workspace")
+        );
+
+        // Test ambiguous session ID without source_path:
+        // If s-1 has a second row with a different cwd, query without source_path must return None
+        let c_path = tmp.path().join("c.jsonl");
+        fs::write(&c_path, "").expect("write");
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, source_path, project, started_at, last_at, message_count, cwd)
+             VALUES ('muse', 's-1', ?1, 'proj', 10, 10, 1, '/different/worktree')",
+            [c_path.to_string_lossy().to_string()],
+        )
+        .expect("insert");
+
+        let ambiguous = store
+            .query_session_cwd(SourceKind::Muse, "s-1", None)
+            .expect("query ambiguous");
+        assert_eq!(ambiguous, None);
     }
 
     #[test]
