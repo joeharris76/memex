@@ -1559,11 +1559,16 @@ fn run_search(
         kind_filter,
     };
 
-    let candidate_limit = if queries.len() > 1
+    // Origin filtering applies after retrieval, so a fixed overfetch can
+    // still starve when wanted-kind matches rank below the cap. Re-run with
+    // a wider cap (bounded) until the filtered list is full or retrieval
+    // stops offering more candidates.
+    let origin_filtered = kind_filter != crate::analytics::SessionKindFilter::All;
+    let mut candidate_limit = if queries.len() > 1
         || top_n_per_session.is_some()
         || options.source.is_some()
         || cwd.is_some()
-        || kind_filter != crate::analytics::SessionKindFilter::All
+        || origin_filtered
     {
         (limit * 5).max(limit + 10)
     } else {
@@ -1577,49 +1582,63 @@ fn run_search(
         SearchMode::Lexical
     };
     let selected_machines = crate::machine::selected_machine_ids(&config, &machines)?;
-    let mut ranked_queries = Vec::with_capacity(queries.len());
-    let mut query_candidate_counts = Vec::with_capacity(queries.len());
     let mut failures = Vec::new();
     let mut seen_failures = HashSet::new();
-    for (query_index, query) in queries.iter().enumerate() {
-        let spec = SearchSpec {
-            query: query.clone(),
-            project: options.project.clone(),
-            role: options.role.clone(),
-            tool: options.tool.clone(),
-            session_id: options.session_id.clone(),
-            session_scope: None,
-            cwd: cwd.clone(),
-            source: options.source,
-            since: options.since,
-            until: options.until,
-            limit: candidate_limit,
-            mode,
-            recency_weight,
-            recency_half_life_days,
-            min_score,
-            project_grouping: None,
-        };
-        let federated =
-            federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
-        query_candidate_counts.push(federated.candidate_count);
-        for (machine, error) in federated.failures {
-            let message = format!("{machine}: {error}");
-            if seen_failures.insert(message.clone()) {
-                eprintln!("Warning: machine '{machine}' unavailable: {error}");
-                failures.push(message);
+    let mut ranked_queries;
+    let mut query_candidate_counts;
+    let mut results;
+    let mut round = 0;
+    loop {
+        ranked_queries = Vec::with_capacity(queries.len());
+        query_candidate_counts = Vec::with_capacity(queries.len());
+        let mut round_capped = false;
+        for (query_index, query) in queries.iter().enumerate() {
+            let spec = SearchSpec {
+                query: query.clone(),
+                project: options.project.clone(),
+                role: options.role.clone(),
+                tool: options.tool.clone(),
+                session_id: options.session_id.clone(),
+                session_scope: None,
+                cwd: cwd.clone(),
+                source: options.source,
+                since: options.since,
+                until: options.until,
+                limit: candidate_limit,
+                mode,
+                recency_weight,
+                recency_half_life_days,
+                min_score,
+                project_grouping: None,
+            };
+            let federated =
+                federated_search(&paths, &config, &selected_machines, &spec, query_index == 0)?;
+            round_capped = round_capped || federated.candidate_count > federated.items.len();
+            query_candidate_counts.push(federated.candidate_count);
+            for (machine, error) in federated.failures {
+                let message = format!("{machine}: {error}");
+                if seen_failures.insert(message.clone()) {
+                    eprintln!("Warning: machine '{machine}' unavailable: {error}");
+                    failures.push(message);
+                }
             }
+            ranked_queries.push(federated.items);
         }
-        ranked_queries.push(federated.items);
+        let fused = if ranked_queries.len() == 1 {
+            ranked_queries.pop().unwrap_or_default()
+        } else {
+            fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
+        };
+        let stored_kinds = stored_session_kinds(&paths, &fused, origin_filtered);
+        let mut merged_render = render.clone();
+        merged_render.min_score = None;
+        results = apply_post_processing_located(fused, &merged_render, &stored_kinds);
+        round += 1;
+        if !origin_filtered || results.len() >= render.limit || !round_capped || round >= 3 {
+            break;
+        }
+        candidate_limit = candidate_limit.saturating_mul(5);
     }
-    let mut results = if ranked_queries.len() == 1 {
-        ranked_queries.pop().unwrap_or_default()
-    } else {
-        fuse_ranked_queries(ranked_queries, crate::retrieval_eval::DEFAULT_RRF_K)
-    };
-    let mut merged_render = render.clone();
-    merged_render.min_score = None;
-    results = apply_post_processing_located(results, &merged_render);
     if trace {
         let mode_label = match (mode, queries.len() > 1) {
             (SearchMode::Lexical, false) => "lexical",
@@ -2838,16 +2857,15 @@ fn run_herdr_resume(
             return Err(anyhow!("session '{session_id}' not found"));
         }
     } else {
-        if rows.iter().any(&interactive) {
-            rows.retain(&interactive);
-        }
+        // Implicit resume never selects a background worker: discard
+        // non-interactive rows even when nothing interactive matches, so
+        // selection falls through to the global fallback or reports none.
+        rows.retain(&interactive);
         if rows.is_empty() && cwd_filter.is_some() && !strict_cwd {
             // The public CLI keeps its historical global fallback unless the Herdr plugin
             // explicitly requires the focused directory to match.
             rows = store.query_sessions_detailed(source, None, None, None, Some(50))?;
-            if rows.iter().any(&interactive) {
-                rows.retain(&interactive);
-            }
+            rows.retain(&interactive);
         }
     }
 
@@ -4559,9 +4577,50 @@ fn wants_field(fields: &Option<HashSet<String>>, name: &str) -> bool {
         .unwrap_or(true)
 }
 
+/// Stored session kinds for the candidate groups, keyed by
+/// (machine, source label, session id) with prefer-main dominance. Remote
+/// machines and sessions missing from the analytics cache simply have no
+/// entry, and grouping falls back to the matched records. Empty unless an
+/// origin filter is active.
+fn stored_session_kinds(
+    paths: &Paths,
+    results: &[LocatedRecord],
+    origin_filtered: bool,
+) -> HashMap<(String, String, String), Option<String>> {
+    let mut out = HashMap::new();
+    if !origin_filtered {
+        return out;
+    }
+    let Ok(store) = open_analytics_read_only(paths) else {
+        return out;
+    };
+    for result in results {
+        let key = (
+            result.machine.clone(),
+            result.record.source.storage_label().to_string(),
+            result.record.session_id.clone(),
+        );
+        let stored = store.session_conversation_kind(
+            result.record.source.storage_label(),
+            &result.record.session_id,
+            &result.record.source_path,
+        );
+        let dominated = stored.as_deref() == Some("main");
+        out.entry(key)
+            .and_modify(|kind: &mut Option<String>| {
+                if dominated {
+                    *kind = Some("main".to_string());
+                }
+            })
+            .or_insert(stored);
+    }
+    out
+}
+
 fn apply_post_processing_located(
     mut results: Vec<LocatedRecord>,
     render: &RenderOptions,
+    stored_kinds: &HashMap<(String, String, String), Option<String>>,
 ) -> Vec<LocatedRecord> {
     if let Some(min_score) = render.min_score {
         results.retain(|result| result.score >= min_score);
@@ -4569,7 +4628,10 @@ fn apply_post_processing_located(
 
     // Session-grouped origin filter with prefer-main: a sidechain hit inside
     // a primary session must not hide the session (mirrors the TUI and the
-    // analytics accumulator).
+    // analytics accumulator). Groups resolve against the stored session kind
+    // first — complete-session truth — and only fall back to the matched
+    // records when the analytics cache has no row (remote machines, stale
+    // caches).
     if render.kind_filter != crate::analytics::SessionKindFilter::All {
         let mut group_kind: HashMap<(String, String, String), Option<String>> = HashMap::new();
         for result in &results {
@@ -4594,9 +4656,11 @@ fn apply_post_processing_located(
                 result.record.source.storage_label().to_string(),
                 result.record.session_id.clone(),
             );
-            render
-                .kind_filter
-                .matches_kind(group_kind.get(&key).and_then(|kind| kind.as_deref()))
+            let kind = stored_kinds
+                .get(&key)
+                .and_then(|stored| stored.as_deref())
+                .or_else(|| group_kind.get(&key).and_then(|kind| kind.as_deref()));
+            render.kind_filter.matches_kind(kind)
         });
     }
 

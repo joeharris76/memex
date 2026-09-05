@@ -17,7 +17,10 @@ use walkdir::WalkDir;
 
 pub const VERSIONS: ParserVersions = ParserVersions {
     identity: 2,
-    index: 2,
+    // Bumped for per-event subagent origin flags: already-indexed
+    // transcripts must reparse so historical inline subagent events
+    // classify by event flags instead of path-only logic.
+    index: 3,
     usage: 3,
 };
 

@@ -533,6 +533,31 @@ impl AnalyticsStore {
         Ok(out)
     }
 
+    /// Stored conversation kind for one exact session identity, if the
+    /// analytics cache has a row for it. Search-result grouping uses this
+    /// complete-session truth so a session is never classified from only
+    /// the matched records; missing rows yield `None` and callers fall
+    /// back to hit-derived kinds.
+    pub fn session_conversation_kind(
+        &self,
+        source: &str,
+        session_id: &str,
+        source_path: &str,
+    ) -> Option<String> {
+        self.conn
+            .query_row(
+                "SELECT conversation_kind FROM sessions
+                 WHERE source = ?1 AND session_id = ?2 AND source_path = ?3",
+                params![source, session_id, source_path],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .filter(|kind| !kind.is_empty())
+    }
+
     pub fn query_projects(
         &self,
         source: Option<SourceFilter>,
@@ -1439,11 +1464,14 @@ fn finish_label(text: &str) -> String {
     let mut collapsed = String::with_capacity(no_ansi.len().min(1024));
     let mut pending_space = false;
     for c in no_ansi.chars() {
-        if c.is_control() && c != ' ' {
-            continue;
-        }
+        // Whitespace first: newlines/tabs are also control characters, and
+        // dropping them here would glue words together ("hello\nworld" must
+        // collapse to "hello world", not "helloworld").
         if c.is_whitespace() {
             pending_space = true;
+            continue;
+        }
+        if c.is_control() {
             continue;
         }
         if pending_space && !collapsed.is_empty() {
@@ -2619,6 +2647,45 @@ mod tests {
         let raw = "a < b and c > d comparison";
         let label = sanitize_label(raw);
         assert_eq!(label, "a < b and c > d comparison");
+    }
+
+    #[test]
+    fn session_conversation_kind_resolves_stored_row() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(&transcript, "").expect("write");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut rec = record("proj", "s-kind", &transcript, 10);
+        rec.role = "user".to_string();
+        rec.text = "do the thing".to_string();
+        rec.links.conversation_kind = Some("fork".to_string());
+        writer.record(&rec).expect("record");
+        writer.flush().expect("flush");
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        assert_eq!(
+            store.session_conversation_kind(
+                SourceKind::Codex.storage_label(),
+                "s-kind",
+                &transcript.to_string_lossy()
+            ),
+            Some("fork".to_string())
+        );
+        assert_eq!(
+            store.session_conversation_kind(
+                SourceKind::Codex.storage_label(),
+                "s-missing",
+                &transcript.to_string_lossy()
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn sanitize_label_keeps_word_boundary_on_control_whitespace() {
+        assert_eq!(sanitize_label("hello\nworld"), "hello world");
+        assert_eq!(sanitize_label("hello\tworld"), "hello world");
+        assert_eq!(sanitize_label("hello\r\nworld"), "hello world");
     }
 
     #[test]

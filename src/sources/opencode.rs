@@ -22,7 +22,11 @@ pub const VERSIONS: ParserVersions = ParserVersions {
 /// Version for the SQLite event cursor and owned-session reconciliation rules.  This is
 /// intentionally independent of the shared source identity/index versions: legacy JSON parsing
 /// has not changed merely because database planning was added.
-pub const DATABASE_STATE_VERSION: u32 = 1;
+///
+/// Bumped for the parent-linkage-only reclassification: unparented sessions
+/// with non-primary agent values were stored as subagent and must reconcile
+/// once so their records and analytics rows reflect the new kinds.
+pub const DATABASE_STATE_VERSION: u32 = 2;
 
 pub fn matches_path(path: &str) -> bool {
     (path.contains("opencode/storage/message") || path.contains("opencode\\storage\\message"))
