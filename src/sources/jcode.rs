@@ -134,6 +134,9 @@ pub(crate) fn parse_index_records(
     next_doc_id: &AtomicU64,
     mut emit: impl FnMut(Record) -> Result<()>,
 ) -> Result<IndexParseOutput> {
+    // Whole-document format: `prepare_file_task` forces whole-file replacement
+    // (delete + reparse from scratch) on any change, so `state.offset` is
+    // intentionally ignored here and every record is re-emitted.
     let mut bytes = std::fs::read(path)?;
     let bytes_len = bytes.len() as u64;
     let mut diagnostics = ParseDiagnostics::default();

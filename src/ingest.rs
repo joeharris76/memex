@@ -240,6 +240,13 @@ fn prepare_file_task(
             previous.pending_tool_calls.clone(),
             true,
         ),
+        // Jcode sessions are whole JSON documents, not appendable JSONL: any change
+        // must delete existing records and re-index from scratch, otherwise the
+        // parser (which replays the full messages array) would duplicate history.
+        Some(previous) if source == SourceKind::Jcode => {
+            let _ = previous;
+            (0, 0, true, HashMap::new(), false)
+        }
         Some(previous) => (
             previous.offset,
             previous.turn_id,
@@ -4344,6 +4351,39 @@ mod tests {
                 .and_then(|call| call.tool_name.as_deref()),
             Some("Read")
         );
+    }
+
+    #[test]
+    fn jcode_append_forces_whole_file_replacement() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session_test.json");
+        fs::write(&path, r#"{"id":"s1","messages":[]}"#).expect("write session");
+        let metadata = path.metadata().expect("session metadata");
+        let (first, _) = prepare_file_task(path.clone(), SourceKind::Jcode, false, &metadata, None);
+        let previous =
+            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append")
+            .write_all(br#", "appended": true}"#)
+            .expect("append");
+        let appended_metadata = path.metadata().expect("appended metadata");
+        let (appended, skip) = prepare_file_task(
+            path,
+            SourceKind::Jcode,
+            false,
+            &appended_metadata,
+            Some(&previous),
+        );
+
+        assert!(!skip);
+        assert!(appended.delete_first);
+        assert_eq!(appended.offset, 0);
+        assert!(appended.pending_tool_calls.is_empty());
     }
 
     #[test]

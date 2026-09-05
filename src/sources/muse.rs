@@ -129,6 +129,45 @@ fn timestamp_millis(value: &BorrowedValue<'_>) -> u64 {
         .unwrap_or(0)
 }
 
+/// Recover session id, project, and base timestamp from an already-indexed
+/// prefix row. Used before resuming at a saved offset so appended-only parses
+/// keep the metadata established by the leading rows.
+fn recover_muse_header(
+    value: &BorrowedValue<'_>,
+    session_id: &mut String,
+    project: &mut String,
+    default_timestamp: &mut u64,
+) {
+    if let Some(stream) = value.get("stream")
+        && let Some(sid) = stream.get("id").and_then(|v| v.as_str())
+        && !sid.is_empty()
+    {
+        *session_id = sid.to_string();
+    }
+    let recorded_at = value.get("recorded_at").map(timestamp_millis).unwrap_or(0);
+    if recorded_at > 0 && *default_timestamp == 0 {
+        *default_timestamp = recorded_at;
+    }
+    let Some(payload) = value.get("payload") else {
+        return;
+    };
+    let kind = payload.get("kind").and_then(|v| v.as_str()).unwrap_or("");
+    if kind != "metadata" && kind != "route_facts" {
+        return;
+    }
+    if let Some(record) = payload.get("record") {
+        if let Some(root) = record.get("workspace_root").and_then(|v| v.as_str())
+            && !root.is_empty()
+        {
+            *project = super::common::project_from_path(root);
+        } else if let Some(cwd) = record.get("cwd").and_then(|v| v.as_str())
+            && !cwd.is_empty()
+        {
+            *project = super::common::project_from_path(cwd);
+        }
+    }
+}
+
 pub(crate) fn parse_index_records(
     path: &Path,
     state: IndexParseState,
@@ -164,6 +203,35 @@ pub(crate) fn parse_index_records(
     let mut default_timestamp = 0;
 
     let mut buf = Vec::new();
+    // On incremental appends parsing resumes at `state.offset`, skipping the
+    // leading metadata/route-facts rows that carry workspace_root/cwd. Recover
+    // them (plus session id and base timestamp) from the already-indexed prefix
+    // first, mirroring the Pi session-header recovery.
+    if start > 0 && !mmap.is_empty() {
+        let prefix_end = start.min(mmap.len());
+        let mut scan = 0;
+        while scan < prefix_end {
+            let slice = &mmap[scan..prefix_end];
+            let rel = memchr(b'\n', slice).unwrap_or(slice.len());
+            let line = &slice[..rel];
+            scan += rel + usize::from(rel < slice.len());
+            if line.is_empty() {
+                continue;
+            }
+            buf.clear();
+            buf.extend_from_slice(line);
+            let Ok(value) = simd_json::to_borrowed_value(&mut buf) else {
+                continue;
+            };
+            recover_muse_header(
+                &value,
+                &mut session_id,
+                &mut project,
+                &mut default_timestamp,
+            );
+        }
+        buf.clear();
+    }
     while start < mmap.len() {
         let slice = &mmap[start..];
         let rel = memchr(b'\n', slice).unwrap_or(slice.len());
@@ -617,5 +685,75 @@ mod tests {
         assert_eq!(events[0].tokens.reasoning, 5);
         assert_eq!(events[0].model.as_deref(), Some("muse-spark-1.2"));
         assert_eq!(events[0].provider.as_deref(), Some("meta"));
+    }
+
+    #[test]
+    fn appended_rows_keep_metadata_project() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("session.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                r#"{"stream":{"kind":"session","id":"sess-1"},"recorded_at":1788308372342264,"payload":{"kind":"metadata","record":{"workspace_root":"/Users/joe/Developer/memex"}}}"#, "\n",
+                r#"{"stream":{"kind":"session","id":"sess-1"},"recorded_at":1788308372900000,"payload":{"kind":"run","event":{"kind":"started","prompt":"Hello"}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+
+        let next_doc_id = AtomicU64::new(1);
+        let mut first_records = Vec::new();
+        let out = parse_index_records(
+            &path,
+            IndexParseState::default(),
+            false,
+            &next_doc_id,
+            |rec| {
+                first_records.push(rec);
+                Ok(())
+            },
+        )
+        .unwrap();
+        assert_eq!(first_records.len(), 1);
+        assert_eq!(first_records[0].project, "memex");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(
+                br#"{"stream":{"kind":"session","id":"sess-1"},"recorded_at":1788308373400000,"payload":{"kind":"run","event":{"kind":"assistant_message_committed","message_id":"m9","text":"Follow-up"}}}"#,
+            )
+            .unwrap();
+        // Newline-terminate the appended row so the resumed parse sees a full line.
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+
+        let mut resumed = Vec::new();
+        let resumed_out = parse_index_records(
+            &path,
+            IndexParseState {
+                offset: out.offset,
+                turn_id: out.turn_id,
+                ..IndexParseState::default()
+            },
+            false,
+            &next_doc_id,
+            |rec| {
+                resumed.push(rec);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(resumed.len(), 1);
+        assert_eq!(resumed[0].project, "memex");
+        assert_eq!(resumed[0].session_id, "sess-1");
+        assert_eq!(resumed_out.turn_id, out.turn_id + 1);
     }
 }
