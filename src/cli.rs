@@ -453,6 +453,12 @@ EXAMPLES:
         /// Maximum number of sessions
         #[arg(long, default_value_t = 20)]
         limit: usize,
+        /// Filter by session kind: primary (interactive), subagent, or all
+        #[arg(long, value_enum, default_value_t = SessionKind::All)]
+        kind: SessionKind,
+        /// Only show primary (interactive) sessions (alias for --kind primary)
+        #[arg(long)]
+        primary_only: bool,
         /// Emit one JSON array instead of JSON Lines
         #[arg(long)]
         json_array: bool,
@@ -699,6 +705,24 @@ impl From<TransferMode> for CoreTransferMode {
         match value {
             TransferMode::Compact => CoreTransferMode::Compact,
             TransferMode::Strict => CoreTransferMode::Strict,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum SessionKind {
+    Primary,
+    Subagent,
+    All,
+}
+
+impl From<SessionKind> for crate::analytics::SessionKindFilter {
+    fn from(value: SessionKind) -> Self {
+        match value {
+            SessionKind::Primary => crate::analytics::SessionKindFilter::Primary,
+            SessionKind::Subagent => crate::analytics::SessionKindFilter::Subagent,
+            SessionKind::All => crate::analytics::SessionKindFilter::All,
         }
     }
 }
@@ -1069,10 +1093,17 @@ pub fn run() -> Result<()> {
             source,
             since,
             limit,
+            kind,
+            primary_only,
             json_array,
             root,
         } => {
-            run_sessions(cwd, project, source, since, limit, json_array, root)?;
+            let kind = if primary_only {
+                SessionKind::Primary
+            } else {
+                kind
+            };
+            run_sessions(cwd, project, source, since, limit, kind, json_array, root)?;
         }
         Commands::Herdr { action } => match action {
             HerdrCommand::ResumeLast {
@@ -2711,12 +2742,14 @@ fn session_resume_command(
     Some((command, cwd))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_sessions(
     cwd: Option<PathBuf>,
     project: Option<String>,
     source: Option<SourceFilter>,
     since: Option<String>,
     limit: usize,
+    kind: SessionKind,
     json_array: bool,
     root: Option<PathBuf>,
 ) -> Result<()> {
@@ -2725,11 +2758,16 @@ fn run_sessions(
     let store = open_analytics_read_only(&paths)?;
     let since_ms = parse_ts_millis(since)?;
     let cwd_filter = canonical_cwd_filter(cwd);
-    let rows = store.query_sessions_detailed(
+    let kind_filter = match kind {
+        SessionKind::All => None,
+        other => Some(other.into()),
+    };
+    let rows = store.query_sessions_detailed_filtered(
         source,
         project.as_deref(),
         cwd_filter.as_deref(),
         since_ms,
+        kind_filter,
         Some(limit),
     )?;
 

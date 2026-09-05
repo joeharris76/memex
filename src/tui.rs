@@ -140,6 +140,7 @@ struct SearchRequest {
     source: SourceChoice,
     since: Option<u64>,
     grouping: ProjectGrouping,
+    kind: crate::analytics::SessionKindFilter,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -502,6 +503,8 @@ struct SessionSummary {
     snippet: String,
     source_path: String,
     source_dir: String,
+    label: Option<String>,
+    conversation_kind: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -532,6 +535,7 @@ struct App {
     machine: String,
     home_machines: Vec<String>,
     source: SourceChoice,
+    session_kind: crate::analytics::SessionKindFilter,
     all_projects: Vec<String>,
     project_options: Vec<String>,
     project_selected: usize,
@@ -970,6 +974,7 @@ impl App {
             home_projects: Vec::new(),
             active_home_filters_request: 0,
             source: SourceChoice::All,
+            session_kind: crate::analytics::SessionKindFilter::Primary,
             all_projects: Vec::new(),
             project_options: Vec::new(),
             project_selected: 0,
@@ -1256,6 +1261,7 @@ impl App {
             source: self.source,
             since: self.sessions_since,
             grouping: self.project_display.grouping(),
+            kind: self.session_kind,
         };
         if self.search_request_tx.send(request).is_err() {
             let message = "search worker stopped".to_string();
@@ -2268,6 +2274,28 @@ impl App {
         }
     }
 
+    fn cycle_session_kind(&mut self) {
+        self.session_kind = match self.session_kind {
+            crate::analytics::SessionKindFilter::Primary => {
+                crate::analytics::SessionKindFilter::All
+            }
+            crate::analytics::SessionKindFilter::All => {
+                crate::analytics::SessionKindFilter::Subagent
+            }
+            crate::analytics::SessionKindFilter::Subagent => {
+                crate::analytics::SessionKindFilter::Primary
+            }
+        };
+        let label = match self.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::All => "all",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+        };
+        self.set_status(format!("sessions: {label}"));
+        self.kickoff_search();
+        self.kickoff_home_activity();
+    }
+
     fn scroll_timeline(&mut self, delta: isize) {
         if self.timeline_rows.is_empty() {
             self.timeline_scroll = 0;
@@ -2906,6 +2934,9 @@ fn handle_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> Resul
                 app.kickoff_home_activity();
             }
         }
+        KeyCode::Char('K') => {
+            app.cycle_session_kind();
+        }
         KeyCode::Char('[') => {
             app.cycle_timeline_range(-1);
         }
@@ -3076,6 +3107,9 @@ fn handle_home_key(key: KeyEvent, terminal: &mut TuiTerminal, app: &mut App) -> 
         }
         KeyCode::Char('p') => {
             app.open_home_dropdown(HomeDropdown::Project);
+        }
+        KeyCode::Char('K') => {
+            app.cycle_session_kind();
         }
         KeyCode::Char('S') => {
             let _ = app.share_selected();
@@ -4054,16 +4088,46 @@ fn session_result_line(
         ),
         Span::raw("  "),
     ];
-    if session.snippet.is_empty() && session.title.is_empty() {
-        spans.push(Span::styled(
-            truncate_middle(&session.session_id, detail_width),
-            theme.muted,
-        ));
-    } else if session.snippet.is_empty() {
-        let title = strip_ansi_and_controls(&session.title);
-        spans.push(Span::styled(truncate_end(&title, detail_width), theme.text));
+    // Show label/title when there is no search snippet (recent/home view), badge subagents
+    let is_subagent = session
+        .conversation_kind
+        .as_deref()
+        .is_some_and(|k| k != "main");
+    if session.snippet.is_empty() {
+        if let Some(label) = session.label.as_deref().filter(|s| !s.is_empty()) {
+            let mut detail = truncate_middle(label, detail_width);
+            if is_subagent {
+                // Prepend a subtle subagent indicator; keep width calculation simple
+                detail = format!("[sub] {detail}");
+                if detail.chars().count() > detail_width {
+                    detail = truncate_middle(&detail, detail_width);
+                }
+            }
+            spans.push(Span::styled(detail, theme.text));
+        } else if !session.title.is_empty() {
+            let title = strip_ansi_and_controls(&session.title);
+            let mut detail = truncate_end(&title, detail_width);
+            if is_subagent {
+                detail = format!("[sub] {detail}");
+                if detail.chars().count() > detail_width {
+                    detail = truncate_middle(&detail, detail_width);
+                }
+            }
+            spans.push(Span::styled(detail, theme.text));
+        } else {
+            spans.push(Span::styled(
+                truncate_middle(&session.session_id, detail_width),
+                theme.muted,
+            ));
+        }
     } else {
         let snippet = strip_ansi_and_controls(&session.snippet);
+        if is_subagent {
+            spans.push(Span::styled(
+                "[sub] ",
+                Style::default().fg(Color::Rgb(160, 120, 80)),
+            ));
+        }
         spans.extend(match_context_spans(&snippet, terms, detail_width, theme));
     }
     Line::from(spans)
@@ -4768,6 +4832,21 @@ fn draw_footer(frame: &mut ratatui::Frame, app: &App, theme: &Theme, area: Rect)
         right_spans.push(Span::styled(app.source.label(), theme.accent));
         right_spans.push(Span::raw("   "));
     }
+    if app.session_kind != crate::analytics::SessionKindFilter::All
+        || app.layout_mode == LayoutMode::Home
+        || app.layout_mode == LayoutMode::List
+        || app.layout_mode == LayoutMode::Split
+    {
+        let kind_label = match app.session_kind {
+            crate::analytics::SessionKindFilter::Primary => "primary",
+            crate::analytics::SessionKindFilter::Subagent => "subagent",
+            crate::analytics::SessionKindFilter::All => "all",
+        };
+        right_spans.push(Span::styled("kind ", theme.muted));
+        right_spans.push(Span::styled("(K) ", theme.accent));
+        right_spans.push(Span::styled(kind_label, theme.text));
+        right_spans.push(Span::raw("   "));
+    }
     if app.layout_mode == LayoutMode::Timeline {
         right_spans.push(Span::styled("source", theme.muted));
         right_spans.push(Span::styled("(s) ", theme.accent));
@@ -4865,6 +4944,8 @@ fn footer_shortcuts<'a>(app: &App, theme: &Theme, width: u16) -> Line<'a> {
             Span::styled(" source  ", theme.muted),
             Span::styled("p", theme.accent),
             Span::styled(" projects  ", theme.muted),
+            Span::styled("K", theme.accent),
+            Span::styled(" kind  ", theme.muted),
             Span::styled("/", theme.accent),
             Span::styled(" search  ", theme.muted),
             Span::styled("tab", theme.accent),
@@ -5092,6 +5173,7 @@ fn sessions_from_recent(
     Ok(out)
 }
 
+#[allow(dead_code)]
 fn sessions_from_analytics(
     paths: &Paths,
     source: Option<SourceFilter>,
@@ -5099,18 +5181,48 @@ fn sessions_from_analytics(
     project: Option<&str>,
     grouping: ProjectGrouping,
 ) -> Result<Vec<SessionSummary>> {
+    sessions_from_analytics_filtered(paths, source, since, project, grouping, None)
+}
+
+fn sessions_from_analytics_filtered(
+    paths: &Paths,
+    source: Option<SourceFilter>,
+    since: Option<u64>,
+    project: Option<&str>,
+    grouping: ProjectGrouping,
+    kind: Option<crate::analytics::SessionKindFilter>,
+) -> Result<Vec<SessionSummary>> {
     let store = AnalyticsStore::open_read_only(analytics_path(&paths.state))?;
-    let rows = store.query_sessions(
-        source,
-        since,
-        project,
-        grouping,
-        Some(RECENT_SESSIONS_LIMIT),
-    )?;
+    let rows = if kind.is_some() {
+        store.query_sessions_filtered(
+            source,
+            since,
+            project,
+            grouping,
+            kind,
+            Some(RECENT_SESSIONS_LIMIT),
+        )?
+    } else {
+        store.query_sessions(
+            source,
+            since,
+            project,
+            grouping,
+            Some(RECENT_SESSIONS_LIMIT),
+        )?
+    };
     if rows.is_empty() {
         anyhow::bail!("no analytics sessions");
     }
     Ok(rows.into_iter().map(session_summary_from_row).collect())
+}
+
+fn session_matches_kind(filter: crate::analytics::SessionKindFilter, kind: Option<&str>) -> bool {
+    match filter {
+        crate::analytics::SessionKindFilter::All => true,
+        crate::analytics::SessionKindFilter::Primary => kind.is_none() || kind == Some("main"),
+        crate::analytics::SessionKindFilter::Subagent => kind.is_some() && kind != Some("main"),
+    }
 }
 
 fn session_summary_from_row(row: SessionRow) -> SessionSummary {
@@ -5124,8 +5236,13 @@ fn session_summary_from_row(row: SessionRow) -> SessionSummary {
         top_score: 0.0,
         title: String::new(),
         snippet: String::new(),
-        source_dir: row.cwd.unwrap_or_else(|| parent_dir(&row.source_path)),
+        source_dir: row
+            .cwd
+            .clone()
+            .unwrap_or_else(|| parent_dir(&row.source_path)),
         source_path: row.source_path,
+        label: row.label,
+        conversation_kind: row.conversation_kind,
     }
 }
 
@@ -5277,6 +5394,7 @@ fn add_record_to_session(
     score: f32,
     record: Record,
 ) {
+    let label = record.links.conversation_kind.clone();
     let entry = sessions
         .entry(record.session_id.clone())
         .or_insert(SessionSummary {
@@ -5291,6 +5409,8 @@ fn add_record_to_session(
             snippet: summarize(&record.text, 160),
             source_path: record.source_path.clone(),
             source_dir: parent_dir(&record.source_path),
+            label: None,
+            conversation_kind: label.clone(),
         });
     entry.hit_count += 1;
     if record.ts > entry.last_ts {
@@ -5333,6 +5453,8 @@ fn add_located_record_to_session(
         snippet: summarize(&record.text, 160),
         source_path: record.source_path.clone(),
         source_dir: parent_dir(&record.source_path),
+        label: None,
+        conversation_kind: record.links.conversation_kind.clone(),
     });
     entry.hit_count += 1;
     entry.last_ts = entry.last_ts.max(record.ts);
@@ -5458,21 +5580,36 @@ fn run_search_request(
         if let Some(project) = project {
             sessions.retain(|session| session.project == project);
         }
+        sessions.retain(|session| {
+            session_matches_kind(request.kind, session.conversation_kind.as_deref())
+        });
         sessions.truncate(RESULT_LIMIT);
         return Ok((sessions, failures));
     }
     if request.query.is_empty() {
-        let mut sessions = sessions_from_analytics(
+        let mut sessions = sessions_from_analytics_filtered(
             paths,
             request.source.as_filter(),
             request.since,
             project,
             request.grouping,
+            Some(request.kind),
         )
         .or_else(|_| {
-            sessions_from_recent(index, request.source.as_filter(), request.since, project)
+            let mut sessions =
+                sessions_from_recent(index, request.source.as_filter(), request.since, project)?;
+            sessions.retain(|session| {
+                session_matches_kind(request.kind, session.conversation_kind.as_deref())
+            });
+            if sessions.is_empty() {
+                anyhow::bail!("no analytics sessions");
+            }
+            Ok(sessions)
         })?;
         enrich_session_titles(index, &mut sessions);
+        sessions.retain(|session| {
+            session_matches_kind(request.kind, session.conversation_kind.as_deref())
+        });
         return Ok((sessions, Vec::new()));
     }
 
@@ -5481,18 +5618,29 @@ fn run_search_request(
     } else {
         None
     };
+    // The kind filter runs after retrieval caps the candidate list, so a
+    // filtered subset could starve the result list. Over-fetch while a subset
+    // is selected, then retain and truncate back to the display cap.
+    let query_limit = if matches!(request.kind, crate::analytics::SessionKindFilter::All) {
+        RESULT_LIMIT
+    } else {
+        RESULT_LIMIT.saturating_mul(5)
+    };
     let mut sessions = sessions_from_query(
         index,
         &request.query,
         request.source.as_filter(),
         tantivy_project,
         request.since,
-        RESULT_LIMIT,
+        query_limit,
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
         sessions.retain(|session| session.project == project);
     }
+    sessions
+        .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
+    sessions.truncate(RESULT_LIMIT);
     Ok((sessions, Vec::new()))
 }
 
@@ -7077,6 +7225,8 @@ mod tests {
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
         };
 
         let line = session_result_line(&session, &[], 8, 40, &Theme::new());
@@ -7105,6 +7255,8 @@ mod tests {
             snippet: String::new(),
             source_path: "source.jsonl".to_string(),
             source_dir: String::new(),
+            label: None,
+            conversation_kind: None,
         });
         app.enter_browse();
         assert_eq!(app.layout_mode, LayoutMode::Split);
@@ -7252,6 +7404,8 @@ mod tests {
                 snippet: String::new(),
                 source_path: "source.jsonl".to_string(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             }],
             failures: Vec::new(),
         });
@@ -7437,6 +7591,8 @@ mod tests {
                 snippet: String::new(),
                 source_path: "codex.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
             SessionSummary {
                 machine: LOCAL_MACHINE_ID.to_string(),
@@ -7450,6 +7606,8 @@ mod tests {
                 snippet: String::new(),
                 source_path: "claude.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
             SessionSummary {
                 machine: "mini".into(),
@@ -7463,6 +7621,8 @@ mod tests {
                 snippet: String::new(),
                 source_path: "remote-codex.jsonl".into(),
                 source_dir: String::new(),
+                label: None,
+                conversation_kind: None,
             },
         ];
 

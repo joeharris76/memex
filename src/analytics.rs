@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
 use std::time::{Duration, Instant};
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 5;
 const GIT_METADATA_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_LABEL_CHARS: usize = 150;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -29,6 +30,17 @@ pub struct SessionRow {
     pub cwd: Option<String>,
     pub last_at: u64,
     pub message_count: u64,
+    pub label: Option<String>,
+    pub conversation_kind: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKindFilter {
+    Primary,
+    Subagent,
+    #[default]
+    All,
 }
 
 /// A session row with every stored column, for `memex sessions`.
@@ -47,6 +59,10 @@ pub struct SessionDetailRow {
     pub started_at: u64,
     pub last_at: u64,
     pub message_count: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub conversation_kind: Option<String>,
 }
 
 pub struct AnalyticsStore {
@@ -75,6 +91,8 @@ struct SessionAccumulator {
     started_at: u64,
     last_at: u64,
     message_count: u64,
+    first_user_text: Option<String>,
+    conversation_kind: Option<String>,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -133,6 +151,8 @@ impl AnalyticsStore {
                 last_at INTEGER NOT NULL,
                 message_count INTEGER NOT NULL DEFAULT 0,
                 resolution_status TEXT NOT NULL DEFAULT '',
+                label TEXT,
+                conversation_kind TEXT,
                 PRIMARY KEY (source, session_id, source_path)
             );
             CREATE INDEX IF NOT EXISTS sessions_last_at_idx ON sessions(last_at);
@@ -142,6 +162,17 @@ impl AnalyticsStore {
                 ON sessions(COALESCE(NULLIF(repo_project, ''), project), last_at);
             CREATE INDEX IF NOT EXISTS sessions_source_last_at_idx ON sessions(source, last_at);
             "#,
+        )?;
+        // Additive migrations for existing databases: ignore duplicate-column errors.
+        for sql in [
+            "ALTER TABLE sessions ADD COLUMN label TEXT",
+            "ALTER TABLE sessions ADD COLUMN conversation_kind TEXT",
+        ] {
+            let _ = self.conn.execute(sql, []);
+        }
+        self.conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS sessions_conversation_kind_idx ON sessions(conversation_kind);
+             CREATE INDEX IF NOT EXISTS sessions_label_idx ON sessions(label);",
         )?;
         let previous_schema_version: Option<i64> = self
             .conn
@@ -155,6 +186,24 @@ impl AnalyticsStore {
         if previous_schema_version != Some(SCHEMA_VERSION) {
             self.conn
                 .execute("DELETE FROM meta WHERE key = 'analytics_complete'", [])?;
+            // Labels generated before the system-tag stripper was complete contained raw
+            // system wrappers and truncated prefixes. Clear them so the next backfill
+            // recomputes with comprehensive stripping and suffix-preserving truncation.
+            let _ = self.conn.execute(
+                "UPDATE sessions SET label = NULL WHERE \
+                 label LIKE '%<system-reminder>%' OR \
+                 label LIKE '%<command-message>%' OR \
+                 label LIKE '%<command-name>%' OR \
+                 label LIKE '%<INSTRUCTIONS>%' OR \
+                 label LIKE '%<environment_context>%' OR \
+                 label LIKE '%<recommended_plugins>%' OR \
+                 label LIKE '%<user_instructions>%' OR \
+                 label LIKE '%<skill>%' OR \
+                 label LIKE '%<%' OR \
+                 label LIKE '# AGENTS.md%' OR \
+                 label LIKE 'You are a reminder observer%'",
+                [],
+            );
         }
         self.conn.execute(
             "INSERT INTO meta(key, value) VALUES('schema_version', ?1)
@@ -238,10 +287,22 @@ impl AnalyticsStore {
         grouping: ProjectGrouping,
         limit: Option<usize>,
     ) -> Result<Vec<SessionRow>> {
+        self.query_sessions_filtered(source, since_ms, project, grouping, None, limit)
+    }
+
+    pub fn query_sessions_filtered(
+        &self,
+        source: Option<SourceFilter>,
+        since_ms: Option<u64>,
+        project: Option<&str>,
+        grouping: ProjectGrouping,
+        kind: Option<SessionKindFilter>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionRow>> {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project,
                     COALESCE(NULLIF(repo_project, ''), project) AS display_project,
-                    cwd, last_at, message_count
+                    cwd, last_at, message_count, label, conversation_kind
              FROM sessions",
         );
         let mut clauses = Vec::new();
@@ -272,6 +333,21 @@ impl AnalyticsStore {
             }
             values.push(rusqlite::types::Value::Text(project.to_string()));
         }
+        if let Some(kind) = kind {
+            match kind {
+                SessionKindFilter::Primary => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind = 'main')".to_string(),
+                    );
+                }
+                SessionKindFilter::Subagent => {
+                    clauses.push(
+                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                    );
+                }
+                SessionKindFilter::All => {}
+            }
+        }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -298,9 +374,11 @@ impl AnalyticsStore {
                 source_path: row.get(2)?,
                 project,
                 display_project,
-                cwd: row.get(5)?,
+                cwd: row.get::<_, Option<String>>(5)?.filter(|v| !v.is_empty()),
                 last_at: row.get::<_, i64>(6)?.max(0) as u64,
                 message_count: row.get::<_, i64>(7)?.max(0) as u64,
+                label: row.get::<_, Option<String>>(8)?.filter(|v| !v.is_empty()),
+                conversation_kind: row.get::<_, Option<String>>(9)?.filter(|v| !v.is_empty()),
             })
         })?;
 
@@ -323,9 +401,21 @@ impl AnalyticsStore {
         since_ms: Option<u64>,
         limit: Option<usize>,
     ) -> Result<Vec<SessionDetailRow>> {
+        self.query_sessions_detailed_filtered(source, project, cwd, since_ms, None, limit)
+    }
+
+    pub fn query_sessions_detailed_filtered(
+        &self,
+        source: Option<SourceFilter>,
+        project: Option<&str>,
+        cwd: Option<&str>,
+        since_ms: Option<u64>,
+        kind: Option<SessionKindFilter>,
+        limit: Option<usize>,
+    ) -> Result<Vec<SessionDetailRow>> {
         let mut sql = String::from(
             "SELECT source, session_id, source_path, project, repo_project,
-                    cwd, git_root, started_at, last_at, message_count
+                    cwd, git_root, started_at, last_at, message_count, label, conversation_kind
              FROM sessions",
         );
         let mut clauses = Vec::new();
@@ -364,6 +454,21 @@ impl AnalyticsStore {
             clauses.push("last_at >= ?".to_string());
             values.push(rusqlite::types::Value::Integer(since_ms as i64));
         }
+        if let Some(kind) = kind {
+            match kind {
+                SessionKindFilter::Primary => {
+                    clauses.push(
+                        "(conversation_kind IS NULL OR conversation_kind = 'main')".to_string(),
+                    );
+                }
+                SessionKindFilter::Subagent => {
+                    clauses.push(
+                        "conversation_kind IS NOT NULL AND conversation_kind != 'main'".to_string(),
+                    );
+                }
+                SessionKindFilter::All => {}
+            }
+        }
         if !clauses.is_empty() {
             sql.push_str(" WHERE ");
             sql.push_str(&clauses.join(" AND "));
@@ -390,6 +495,8 @@ impl AnalyticsStore {
                 started_at: row.get::<_, i64>(7)?.max(0) as u64,
                 last_at: row.get::<_, i64>(8)?.max(0) as u64,
                 message_count: row.get::<_, i64>(9)?.max(0) as u64,
+                label: row.get::<_, Option<String>>(10)?.filter(|v| !v.is_empty()),
+                conversation_kind: row.get::<_, Option<String>>(11)?.filter(|v| !v.is_empty()),
             })
         })?;
 
@@ -694,6 +801,8 @@ impl AnalyticsWriter {
                 started_at: record.ts,
                 last_at: record.ts,
                 message_count: 0,
+                first_user_text: None,
+                conversation_kind: None,
             });
         if record.ts < entry.started_at {
             entry.started_at = record.ts;
@@ -705,6 +814,19 @@ impl AnalyticsWriter {
             }
         }
         entry.message_count = entry.message_count.saturating_add(1);
+        if entry.first_user_text.is_none()
+            && record.role == "user"
+            && !record.text.trim().is_empty()
+            && !sanitize_label(&record.text).is_empty()
+        {
+            entry.first_user_text = Some(record.text.clone());
+        }
+        if entry.conversation_kind.is_none()
+            && let Some(kind) = record.links.conversation_kind.clone()
+            && !kind.is_empty()
+        {
+            entry.conversation_kind = Some(kind);
+        }
         Ok(())
     }
 
@@ -726,9 +848,10 @@ impl AnalyticsWriter {
                 r#"
                 INSERT INTO sessions(
                     source, session_id, source_path, project, cwd, git_root, git_common_dir,
-                    repo_project, started_at, last_at, message_count, resolution_status
+                    repo_project, started_at, last_at, message_count, resolution_status,
+                    label, conversation_kind
                 )
-                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                VALUES(?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
                 ON CONFLICT(source, session_id, source_path) DO UPDATE SET
                     project = excluded.project,
                     cwd = excluded.cwd,
@@ -738,10 +861,27 @@ impl AnalyticsWriter {
                     started_at = MIN(sessions.started_at, excluded.started_at),
                     last_at = MAX(sessions.last_at, excluded.last_at),
                     message_count = sessions.message_count + excluded.message_count,
-                    resolution_status = excluded.resolution_status
+                    resolution_status = excluded.resolution_status,
+                    label = COALESCE(sessions.label, excluded.label),
+                    conversation_kind = COALESCE(excluded.conversation_kind, sessions.conversation_kind)
                 "#,
             )?;
             for (session, metadata) in sessions {
+                let label = extract_session_label(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.first_user_text.as_deref(),
+                    metadata.cwd.as_deref(),
+                );
+                let conversation_kind = infer_session_kind(
+                    session.key.source,
+                    &session.key.source_path,
+                    &session.key.session_id,
+                    session.conversation_kind.as_deref(),
+                    metadata.cwd.as_deref(),
+                    session.first_user_text.as_deref(),
+                );
                 stmt.execute(params![
                     session.key.source.storage_label(),
                     session.key.session_id,
@@ -755,6 +895,8 @@ impl AnalyticsWriter {
                     session.last_at as i64,
                     session.message_count as i64,
                     metadata.resolution_status,
+                    label,
+                    conversation_kind,
                 ])?;
             }
         }
@@ -1125,6 +1267,457 @@ fn parse_copilot_workspace_cwd(contents: &str) -> CopilotWorkspaceCwd {
         }
     }
     workspace
+}
+
+#[allow(clippy::while_let_loop)]
+pub fn sanitize_label(raw: &str) -> String {
+    // Comprehensive stripping of system wrappers (case-insensitive).
+    // Fast path: neither the tag stripper nor the generic unwrap can match
+    // without a '<', so skip both scans for ordinary prose. This keeps the
+    // per-record emptiness check in `record` cheap during index scans.
+    let mut current = raw.to_string();
+    if current.contains('<') {
+        const DROP_TAGS: &[&str] = &[
+            "system-reminder",
+            "command-message",
+            "command-name",
+            "local-command-stdout",
+            "local-command-caveat",
+            "local-command-output",
+            "instructions",
+            "environment_context",
+            "cwd",
+            "approval_policy",
+            "shell",
+            "user_instructions",
+            "recommended_plugins",
+            "skill",
+            "user_action",
+            "context",
+            "task-notification",
+            "task-id",
+            "tool-use-id",
+            "subagent_notification",
+            "turn_aborted",
+            "current_date",
+            "timezone",
+            "epoch",
+            "collaboration_mode",
+            "apps_instructions",
+            "permissions",
+            "total_tokens",
+        ];
+        for tag in DROP_TAGS {
+            let open = format!("<{tag}");
+            let close = format!("</{tag}>");
+            loop {
+                let Some(start) = find_ascii_ci(&current, &open) else {
+                    break;
+                };
+                let open_end = match current[start..].find('>') {
+                    Some(p) => start + p + 1,
+                    None => {
+                        current.truncate(start);
+                        break;
+                    }
+                };
+                if let Some(end_offset) = find_ascii_ci(&current[open_end..], &close) {
+                    let abs_end = open_end + end_offset + close.len();
+                    current.replace_range(start..abs_end, " ");
+                } else {
+                    current.truncate(start);
+                    break;
+                }
+            }
+        }
+        // Generic unwrap: remove any remaining <...> tags but keep inner text.
+        let mut search_start = 0;
+        loop {
+            let Some(rel_start) = current[search_start..].find('<') else {
+                break;
+            };
+            let start = search_start + rel_start;
+            let Some(end) = current[start..].find('>') else {
+                break;
+            };
+            let abs_end = start + end + 1;
+            let after_lt = current[start + 1..].chars().next().unwrap_or(' ');
+            if after_lt.is_ascii_alphabetic() || after_lt == '/' || after_lt == '!' {
+                current.replace_range(start..abs_end, " ");
+                search_start = start;
+            } else {
+                search_start = abs_end;
+            }
+            if current.len() > 10000 {
+                break;
+            }
+        }
+    }
+    let ansi_stripped = strip_ansi(&current);
+    let collapsed = ansi_stripped
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let trimmed = collapsed.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("# agents.md")
+        || lower.contains("global agent preferences")
+        || lower.starts_with("you are a reminder observer")
+    {
+        return String::new();
+    }
+    // Remove non-printable control chars
+    let printable: String = trimmed
+        .chars()
+        .filter(|c| !c.is_control() || *c == ' ')
+        .collect();
+    let printable = printable.trim();
+    if printable.is_empty() {
+        return String::new();
+    }
+    if printable.chars().count() <= MAX_LABEL_CHARS {
+        return printable.to_string();
+    }
+    // Suffix-preserving truncation: keep head and tail to preserve distinguishing suffix.
+    const TAIL_LEN: usize = 40;
+    let head_len = MAX_LABEL_CHARS.saturating_sub(TAIL_LEN + 1);
+    let head_raw: String = printable.chars().take(head_len).collect();
+    let head = if let Some(pos) = head_raw.rfind(' ') {
+        if pos > 80 {
+            head_raw[..pos].to_string()
+        } else {
+            head_raw
+        }
+    } else {
+        head_raw
+    };
+    let rev_tail: String = printable.chars().rev().take(TAIL_LEN).collect();
+    let tail_raw: String = rev_tail.chars().rev().collect();
+    let tail = if let Some(pos) = tail_raw.find(' ') {
+        tail_raw[pos + 1..].trim().to_string()
+    } else {
+        tail_raw.trim().to_string()
+    };
+    if tail.is_empty() {
+        let mut out = head;
+        out.push('…');
+        return out;
+    }
+    let mut tail = tail;
+    while head.chars().count() + 1 + tail.chars().count() > MAX_LABEL_CHARS {
+        if let Some(pos) = tail.find(' ') {
+            tail = tail[pos + 1..].trim().to_string();
+        } else if tail.chars().count() > 10 {
+            tail = tail.chars().skip(tail.chars().count() - 10).collect();
+        } else {
+            break;
+        }
+    }
+    format!("{}…{}", head, tail)
+}
+
+/// ASCII case-insensitive substring search over the original string's bytes.
+/// Tag patterns are pure ASCII, so byte-wise matching keeps every index in the
+/// original string's coordinates: Unicode `to_lowercase` can shift byte
+/// offsets (e.g. U+0130 folds 2 bytes into 3), which would make `replace_range`
+/// or `truncate` panic on a non-char-boundary. Every match starts at a `<`
+/// byte, which is always a char boundary in UTF-8.
+fn find_ascii_ci(haystack: &str, needle: &str) -> Option<usize> {
+    let hay = haystack.as_bytes();
+    let ndl = needle.as_bytes();
+    if ndl.is_empty() || hay.len() < ndl.len() {
+        return None;
+    }
+    (0..=hay.len() - ndl.len()).find(|&i| hay[i..i + ndl.len()].eq_ignore_ascii_case(ndl))
+}
+
+fn strip_ansi(input: &str) -> String {
+    if !input.contains('\x1b') {
+        return input.to_string();
+    }
+    let mut out = String::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            // CSI: ESC [ ... letter
+            if i + 1 < bytes.len() && bytes[i + 1] == b'[' {
+                i += 2;
+                while i < bytes.len() && !bytes[i].is_ascii_alphabetic() {
+                    i += 1;
+                }
+                if i < bytes.len() {
+                    i += 1;
+                }
+                continue;
+            }
+            // OSC: ESC ] ... BEL or ESC \
+            if i + 1 < bytes.len() && bytes[i + 1] == b']' {
+                i += 2;
+                while i < bytes.len()
+                    && bytes[i] != 0x07
+                    && !(bytes[i] == 0x1b && i + 1 < bytes.len() && bytes[i + 1] == b'\\')
+                {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == 0x07 {
+                    i += 1;
+                } else if i + 1 < bytes.len() && bytes[i] == 0x1b {
+                    i += 2;
+                }
+                continue;
+            }
+            i += 1;
+            continue;
+        }
+        // Copy one full UTF-8 scalar value: pushing a single byte as char
+        // would corrupt multi-byte sequences (e.g. emoji) into mojibake and
+        // inflate char counts used by truncation. `i` always rests on a char
+        // boundary here because every skipped escape sequence is pure ASCII.
+        let Some(ch) = input[i..].chars().next() else {
+            break;
+        };
+        out.push(ch);
+        i += ch.len_utf8();
+    }
+    out
+}
+
+fn opencode_title_for_session(db_path: &str, session_id: &str) -> Option<String> {
+    let path = Path::new(db_path);
+    if !path.is_file() {
+        return None;
+    }
+    let conn = Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.busy_timeout(Duration::from_secs(1)).ok()?;
+    let mut stmt = conn
+        .prepare("SELECT title FROM session WHERE id = ?1")
+        .ok()?;
+    let title: Option<String> = stmt
+        .query_row(params![session_id], |row| row.get(0))
+        .optional()
+        .ok()
+        .flatten()
+        .filter(|t: &String| !t.trim().is_empty());
+    title
+}
+
+fn grok_title_for_session(updates_path: &str) -> Option<String> {
+    let path = Path::new(updates_path);
+    let parent = path.parent()?;
+    let summary_path = parent.join("summary.json");
+    let contents = std::fs::read_to_string(&summary_path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    for key in [
+        "generated_title",
+        "generatedTitle",
+        "title",
+        "session_summary",
+        "sessionSummary",
+        "summary",
+    ] {
+        if let Some(title) = value
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s: &&str| !s.trim().is_empty())
+        {
+            return Some(title.to_string());
+        }
+        if let Some(title) = value
+            .pointer(&format!("/info/{key}"))
+            .and_then(|v| v.as_str())
+            .filter(|s: &&str| !s.trim().is_empty())
+        {
+            return Some(title.to_string());
+        }
+    }
+    value
+        .get("info")
+        .and_then(|info| info.get("generated_title").or_else(|| info.get("title")))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            value
+                .pointer("/info/cwd")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string())
+        })
+}
+
+fn jcode_label_from_file(path: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&contents).ok()?;
+    let messages = value.get("messages")?.as_array()?;
+    for msg in messages {
+        let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+        if role != "user" {
+            continue;
+        }
+        let content = msg.get("content")?;
+        let mut texts = Vec::new();
+        if let Some(arr) = content.as_array() {
+            for block in arr {
+                if let Some(text) = block.get("text").and_then(|v| v.as_str()) {
+                    texts.push(text.to_string());
+                } else if let Some(text) = block.as_str() {
+                    texts.push(text.to_string());
+                }
+            }
+        } else if let Some(text) = content.as_str() {
+            texts.push(text.to_string());
+        }
+        let combined = texts.join("\n");
+        if combined.trim().is_empty() {
+            continue;
+        }
+        // Skip pure <system-reminder> messages – look for next user message.
+        if sanitize_label(&combined).is_empty() {
+            continue;
+        }
+        return Some(combined);
+    }
+    None
+}
+
+fn opencode_agent_is_subagent(db_path: &str, session_id: &str) -> bool {
+    let path = Path::new(db_path);
+    if !path.is_file() {
+        return false;
+    }
+    let conn = match Connection::open_with_flags(
+        path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    ) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    let _ = conn.busy_timeout(Duration::from_secs(1));
+    let check = || -> Option<bool> {
+        let mut stmt = conn
+            .prepare("SELECT agent FROM session WHERE id = ?1")
+            .ok()?;
+        let agent: Option<String> = stmt
+            .query_row(params![session_id], |row| row.get(0))
+            .optional()
+            .ok()
+            .flatten();
+        Some(!crate::sources::opencode::opencode_agent_is_primary(
+            agent.as_deref(),
+        ))
+    };
+    check().unwrap_or(false)
+}
+
+fn extract_session_label(
+    source: SourceKind,
+    source_path: &str,
+    session_id: &str,
+    first_user_text: Option<&str>,
+    _cwd: Option<&str>,
+) -> Option<String> {
+    let raw = match source {
+        SourceKind::Opencode => {
+            if let Some(title) = opencode_title_for_session(source_path, session_id)
+                && !title.trim().is_empty()
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Grok => {
+            if let Some(title) = grok_title_for_session(source_path)
+                && !title.trim().is_empty()
+            {
+                title
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        SourceKind::Jcode => {
+            if let Some(text) = jcode_label_from_file(source_path) {
+                text
+            } else {
+                first_user_text?.to_string()
+            }
+        }
+        _ => first_user_text?.to_string(),
+    };
+    let label = sanitize_label(&raw);
+    if label.is_empty() { None } else { Some(label) }
+}
+
+fn infer_session_kind(
+    source: SourceKind,
+    source_path: &str,
+    session_id: &str,
+    initial_kind: Option<&str>,
+    cwd: Option<&str>,
+    first_user_text: Option<&str>,
+) -> Option<String> {
+    if let Some(kind) = initial_kind
+        && kind != "main"
+        && !kind.is_empty()
+    {
+        return Some(kind.to_string());
+    }
+    match source {
+        SourceKind::Jcode => {
+            if let Some(cwd) = cwd
+                && (cwd.starts_with("/tmp/")
+                    || cwd.starts_with("/private/tmp/")
+                    || cwd == "/tmp"
+                    || cwd == "/private/tmp")
+            {
+                return Some("subagent".to_string());
+            }
+            if let Some(text) = first_user_text {
+                let lower = text.to_lowercase();
+                if lower.contains("you are a low-effort fact-checker")
+                    || lower.contains("role: manager")
+                    || lower.contains("you are a subagent")
+                    || lower.contains("you are a low effort")
+                {
+                    return Some("subagent".to_string());
+                }
+            }
+        }
+        SourceKind::Opencode => {
+            if opencode_agent_is_subagent(source_path, session_id) {
+                return Some("subagent".to_string());
+            }
+        }
+        SourceKind::Muse => {
+            let normalized = source_path.replace('\\', "/");
+            if normalized.contains("/subagent/") {
+                return Some("subagent".to_string());
+            }
+        }
+        SourceKind::Claude => {
+            let normalized = source_path.replace('\\', "/");
+            if normalized.contains("/subagents/") || normalized.contains("/subagent/") {
+                return Some("subagent".to_string());
+            }
+        }
+        SourceKind::Cursor => {
+            let normalized = source_path.replace('\\', "/");
+            if normalized.contains("/subagents/") || normalized.contains("subagents") {
+                return Some("subagent".to_string());
+            }
+        }
+        SourceKind::Codex => {}
+        _ => {}
+    }
+    Some("main".to_string())
 }
 
 pub fn analytics_path(state_dir: &Path) -> PathBuf {
@@ -1574,5 +2167,202 @@ mod tests {
             .expect("query");
         assert_eq!(rows[0].project, "ssh-d4309b74-100f-407e-b64d-31c7160044cd");
         assert_eq!(rows[0].display_project, "atm-backend");
+    }
+
+    #[test]
+    fn sanitize_label_collapses_whitespace_and_truncates() {
+        let raw = "  Hello\n   world   \x1b[31mred\x1b[0m  <system-reminder>ignore</system-reminder>  this is a very long prompt that should be truncated at word boundary because it exceeds the one hundred fifty character limit significantly and we want to ensure ellipsis handling works correctly for display";
+        let label = sanitize_label(raw);
+        assert!(!label.contains('\n'));
+        assert!(!label.contains("\x1b"));
+        assert!(!label.contains("ignore"));
+        assert!(label.chars().count() <= MAX_LABEL_CHARS);
+        assert!(label.ends_with('…') || label.chars().count() < MAX_LABEL_CHARS);
+        assert!(label.starts_with("Hello world red"));
+    }
+
+    #[test]
+    fn strip_ansi_preserves_multibyte_unicode() {
+        let label = sanitize_label("Fix the 🚀 deploy \x1b[31mred\x1b[0m pipeline ✅ now");
+        assert_eq!(label, "Fix the 🚀 deploy red pipeline ✅ now");
+        assert!(label.contains('🚀'));
+    }
+
+    #[test]
+    fn sanitize_label_truncates_unicode_by_chars_not_bytes() {
+        let raw = "🚀".repeat(200);
+        let label = sanitize_label(&raw);
+        assert!(label.chars().count() <= MAX_LABEL_CHARS);
+        assert!(label.contains('…'));
+        assert!(label.starts_with("🚀"));
+    }
+
+    #[test]
+    fn sanitize_label_with_unicode_case_fold_before_tag_does_not_panic() {
+        // U+0130 folds to 2 chars on lowercase; byte offsets computed on the
+        // folded copy would be wrong for the original. Must strip safely.
+        let raw = "İstanbul \u{130} <SYSTEM-REMINDER>hidden</SYSTEM-REMINDER> visible task";
+        let label = sanitize_label(raw);
+        assert!(!label.contains("hidden"));
+        assert!(!label.contains("SYSTEM-REMINDER"));
+        assert!(label.contains("visible task"));
+    }
+
+    #[test]
+    fn sanitize_label_preserves_lone_comparison_brackets() {
+        let raw = "a < b and c > d comparison";
+        let label = sanitize_label(raw);
+        assert_eq!(label, "a < b and c > d comparison");
+    }
+
+    #[test]
+    fn analytics_stores_label_from_first_user_message() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut rec = record("proj", "s-label", &transcript, 10);
+        rec.role = "user".to_string();
+        rec.text = "Fix the login bug on the dashboard".to_string();
+        rec.links.conversation_kind = Some("main".to_string());
+        writer.record(&rec).expect("record");
+        writer.flush().expect("flush");
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let rows = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].label.as_deref(),
+            Some("Fix the login bug on the dashboard")
+        );
+        assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn analytics_preserves_label_on_incremental_append() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut first = record("proj", "s-append", &transcript, 10);
+        first.role = "user".to_string();
+        first.text = "Fix the login bug on the dashboard".to_string();
+        first.links.conversation_kind = Some("main".to_string());
+        writer.record(&first).expect("record");
+        writer.flush().expect("flush");
+
+        // An append-only batch resumes past the original prompt, so its
+        // derived label reflects a later turn and must not replace the stored one.
+        let mut later = record("proj", "s-append", &transcript, 20);
+        later.role = "user".to_string();
+        later.text = "Also check the settings page".to_string();
+        later.links.conversation_kind = Some("main".to_string());
+        writer.record(&later).expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let rows = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].label.as_deref(),
+            Some("Fix the login bug on the dashboard")
+        );
+    }
+
+    #[test]
+    fn analytics_filters_by_conversation_kind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let a_path = tmp.path().join("a.jsonl");
+        let b_path = tmp.path().join("b.jsonl");
+        for p in [&a_path, &b_path] {
+            fs::write(p, "").expect("write");
+        }
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut primary = record("proj", "s-primary", &a_path, 10);
+        primary.role = "user".to_string();
+        primary.text = "primary task".to_string();
+        primary.links.conversation_kind = Some("main".to_string());
+        let mut sub = record("proj", "s-sub", &b_path, 20);
+        sub.role = "user".to_string();
+        sub.text = "subagent task".to_string();
+        sub.links.conversation_kind = Some("subagent".to_string());
+        writer.record(&primary).expect("record");
+        writer.record(&sub).expect("record");
+        writer.flush().expect("flush");
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let primary_rows = store
+            .query_sessions_detailed_filtered(
+                None,
+                None,
+                None,
+                None,
+                Some(SessionKindFilter::Primary),
+                None,
+            )
+            .expect("primary");
+        assert_eq!(primary_rows.len(), 1);
+        assert_eq!(primary_rows[0].session_id, "s-primary");
+        let sub_rows = store
+            .query_sessions_detailed_filtered(
+                None,
+                None,
+                None,
+                None,
+                Some(SessionKindFilter::Subagent),
+                None,
+            )
+            .expect("sub");
+        assert_eq!(sub_rows.len(), 1);
+        assert_eq!(sub_rows[0].session_id, "s-sub");
+        let all_rows = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("all");
+        assert_eq!(all_rows.len(), 2);
+    }
+
+    #[test]
+    fn jcode_tmp_cwd_is_classified_as_subagent() {
+        let _tmp = tempfile::tempdir().expect("tempdir");
+        let _transcript = _tmp.path().join("session_session_tmp.json");
+        // Need a file that contains cwd; but we also need to test inference via cwd.
+        // We'll directly test infer_session_kind helper.
+        let kind = infer_session_kind(
+            SourceKind::Jcode,
+            "/tmp/.jcode/sessions/session_tmp.json",
+            "session_tmp",
+            Some("main"),
+            Some("/tmp/work"),
+            Some("hello"),
+        );
+        assert_eq!(kind.as_deref(), Some("subagent"));
+        let kind2 = infer_session_kind(
+            SourceKind::Jcode,
+            "/tmp/.jcode/sessions/session_main.json",
+            "session_main",
+            Some("main"),
+            Some("/Users/joe/Code/memex"),
+            Some("hello"),
+        );
+        assert_eq!(kind2.as_deref(), Some("main"));
     }
 }

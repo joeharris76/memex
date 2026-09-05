@@ -163,16 +163,60 @@ pub(crate) fn parse_index_records(
         .filter(|s| !s.is_empty())
         .map(str::to_string);
 
-    let conversation_kind = if parent_session_id.is_some() {
-        "subagent"
-    } else {
-        "main"
-    };
-
     let working_dir = value
         .get("working_dir")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+
+    let mut conversation_kind = if parent_session_id.is_some()
+        || working_dir.starts_with("/tmp/")
+        || working_dir.starts_with("/private/tmp/")
+        || working_dir == "/tmp"
+        || working_dir == "/private/tmp"
+    {
+        "subagent"
+    } else {
+        "main"
+    };
+    // Check directives in first user message for subagent hints
+    if conversation_kind == "main"
+        && let Some(messages) = value.get("messages").and_then(|v| v.as_array())
+    {
+        for message in messages.iter().take(3) {
+            let Some(obj) = message.as_object() else {
+                continue;
+            };
+            if obj.get("role").and_then(|v| v.as_str()) != Some("user") {
+                continue;
+            }
+            let mut first_text = String::new();
+            if let Some(content) = obj.get("content") {
+                if let Some(s) = content.as_str() {
+                    first_text = s.to_string();
+                } else if let Some(arr) = content.as_array() {
+                    for block in arr {
+                        if let Some(t) = block
+                            .as_object()
+                            .and_then(|o| o.get("text"))
+                            .and_then(|v| v.as_str())
+                        {
+                            first_text.push_str(t);
+                            first_text.push('\n');
+                        }
+                    }
+                }
+            }
+            let lower = first_text.to_lowercase();
+            if lower.contains("you are a low-effort fact-checker")
+                || lower.contains("role: manager")
+                || lower.contains("you are a subagent")
+            {
+                conversation_kind = "subagent";
+                break;
+            }
+            break;
+        }
+    }
 
     let project = if !working_dir.is_empty() {
         super::common::project_from_path(working_dir)
