@@ -862,7 +862,7 @@ impl AnalyticsWriter {
                     last_at = MAX(sessions.last_at, excluded.last_at),
                     message_count = sessions.message_count + excluded.message_count,
                     resolution_status = excluded.resolution_status,
-                    label = COALESCE(excluded.label, sessions.label),
+                    label = COALESCE(sessions.label, excluded.label),
                     conversation_kind = COALESCE(excluded.conversation_kind, sessions.conversation_kind)
                 "#,
             )?;
@@ -1610,7 +1610,9 @@ fn opencode_agent_is_subagent(db_path: &str, session_id: &str) -> bool {
             .optional()
             .ok()
             .flatten();
-        Some(agent.is_some_and(|a| !a.is_empty() && a != "build"))
+        Some(!crate::sources::opencode::opencode_agent_is_primary(
+            agent.as_deref(),
+        ))
     };
     check().unwrap_or(false)
 }
@@ -2243,6 +2245,47 @@ mod tests {
             Some("Fix the login bug on the dashboard")
         );
         assert_eq!(rows[0].conversation_kind.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn analytics_preserves_label_on_incremental_append() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let transcript = tmp.path().join("session.jsonl");
+        fs::write(
+            &transcript,
+            format!(
+                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                tmp.path().display()
+            ),
+        )
+        .expect("write");
+        let db = tmp.path().join("analytics.sqlite");
+        let mut writer = AnalyticsWriter::open(&db).expect("open");
+        let mut first = record("proj", "s-append", &transcript, 10);
+        first.role = "user".to_string();
+        first.text = "Fix the login bug on the dashboard".to_string();
+        first.links.conversation_kind = Some("main".to_string());
+        writer.record(&first).expect("record");
+        writer.flush().expect("flush");
+
+        // An append-only batch resumes past the original prompt, so its
+        // derived label reflects a later turn and must not replace the stored one.
+        let mut later = record("proj", "s-append", &transcript, 20);
+        later.role = "user".to_string();
+        later.text = "Also check the settings page".to_string();
+        later.links.conversation_kind = Some("main".to_string());
+        writer.record(&later).expect("record");
+        writer.flush().expect("flush");
+
+        let store = AnalyticsStore::open_read_only(&db).expect("open ro");
+        let rows = store
+            .query_sessions_detailed(None, None, None, None, None)
+            .expect("query");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].label.as_deref(),
+            Some("Fix the login bug on the dashboard")
+        );
     }
 
     #[test]

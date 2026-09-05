@@ -303,6 +303,13 @@ fn nonnegative_timestamp(value: i64) -> Result<u64> {
     u64::try_from(value).map_err(|_| anyhow::anyhow!("negative timestamp"))
 }
 
+/// OpenCode's interactive primary agents. `plan` is a primary interactive mode,
+/// not a subagent, even though it is not `build`. Anything else recorded in
+/// the session `agent` column runs as a subagent.
+pub(crate) fn opencode_agent_is_primary(agent: Option<&str>) -> bool {
+    matches!(agent, None | Some("") | Some("build") | Some("plan"))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DatabaseCursor {
     pub event_rowid: i64,
@@ -752,7 +759,7 @@ pub(crate) fn parse_database_records(
         thread_source: session.parent_id.as_ref().map(|_| "fork".to_string()),
         conversation_kind: Some(if session.parent_id.is_some() {
             "fork".to_string()
-        } else if session.agent.as_deref().is_some_and(|a| a != "build") {
+        } else if !opencode_agent_is_primary(session.agent.as_deref()) {
             "subagent".to_string()
         } else {
             "main".to_string()
@@ -1235,6 +1242,16 @@ mod tests {
         assert_eq!(events[0].tokens.output, 50);
         assert_eq!(events[0].tokens.total(), 200);
         assert_eq!(events[0].project.as_deref(), Some("opencode"));
+    }
+
+    #[test]
+    fn plan_and_build_agents_are_primary() {
+        assert!(opencode_agent_is_primary(None));
+        assert!(opencode_agent_is_primary(Some("")));
+        assert!(opencode_agent_is_primary(Some("build")));
+        assert!(opencode_agent_is_primary(Some("plan")));
+        assert!(!opencode_agent_is_primary(Some("explore")));
+        assert!(!opencode_agent_is_primary(Some("custom-agent")));
     }
 
     #[test]

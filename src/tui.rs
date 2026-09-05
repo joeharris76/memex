@@ -5618,13 +5618,21 @@ fn run_search_request(
     } else {
         None
     };
+    // The kind filter runs after retrieval caps the candidate list, so a
+    // filtered subset could starve the result list. Over-fetch while a subset
+    // is selected, then retain and truncate back to the display cap.
+    let query_limit = if matches!(request.kind, crate::analytics::SessionKindFilter::All) {
+        RESULT_LIMIT
+    } else {
+        RESULT_LIMIT.saturating_mul(5)
+    };
     let mut sessions = sessions_from_query(
         index,
         &request.query,
         request.source.as_filter(),
         tantivy_project,
         request.since,
-        RESULT_LIMIT,
+        query_limit,
     )?;
     enrich_session_projects(paths, &mut sessions, request.grouping);
     if let Some(project) = project {
@@ -5632,6 +5640,7 @@ fn run_search_request(
     }
     sessions
         .retain(|session| session_matches_kind(request.kind, session.conversation_kind.as_deref()));
+    sessions.truncate(RESULT_LIMIT);
     Ok((sessions, Vec::new()))
 }
 
