@@ -513,7 +513,7 @@ fn assemble_usage_events(
     };
     type SourceScanner =
         fn(&mut Vec<UsageEvent>, &mut Vec<String>, Option<&mut UsageCache>) -> Result<()>;
-    const SCANNERS: [(SourceFilter, SourceScanner); 10] = [
+    const SCANNERS: [(SourceFilter, SourceScanner); 12] = [
         (SourceFilter::Claude, scan_claude),
         (SourceFilter::Codex, scan_codex),
         (SourceFilter::Opencode, scan_opencode),
@@ -524,6 +524,8 @@ fn assemble_usage_events(
         (SourceFilter::Copilot, scan_copilot),
         (SourceFilter::Grok, scan_grok),
         (SourceFilter::Hermes, scan_hermes),
+        (SourceFilter::Jcode, scan_jcode),
+        (SourceFilter::Muse, scan_muse),
     ];
     for (filter, scanner) in SCANNERS {
         if source.is_none_or(|selected| selected == filter) {
@@ -1424,6 +1426,48 @@ fn scan_hermes(
         warnings,
         out,
         crate::sources::hermes::parse_usage_file,
+    );
+    Ok(())
+}
+
+fn scan_jcode(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::jcode::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "jcode",
+            parser_version: crate::sources::jcode::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::jcode::parse_usage_file(path).map(FileParse::cacheable),
+    );
+    Ok(())
+}
+
+fn scan_muse(
+    out: &mut Vec<UsageEvent>,
+    warnings: &mut Vec<String>,
+    cache: Option<&mut UsageCache>,
+) -> Result<()> {
+    let files = crate::sources::muse::usage_files();
+    scan_files_cached(
+        SourceScan {
+            source: "muse",
+            parser_version: crate::sources::muse::VERSIONS.usage,
+            volatile_reuse_ms: |_| None,
+        },
+        &files,
+        cache,
+        warnings,
+        out,
+        |path| crate::sources::muse::parse_usage_file(path).map(FileParse::cacheable),
     );
     Ok(())
 }

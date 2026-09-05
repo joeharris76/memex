@@ -585,6 +585,8 @@ fn parse_source(value: &str) -> Result<SourceFilter> {
         "copilot" => Ok(SourceFilter::Copilot),
         "grok" => Ok(SourceFilter::Grok),
         "hermes" => Ok(SourceFilter::Hermes),
+        "jcode" => Ok(SourceFilter::Jcode),
+        "muse" => Ok(SourceFilter::Muse),
         _ => Err(anyhow!("unknown source: {value}")),
     }
 }
@@ -896,6 +898,20 @@ mod tests {
         let request = SearchRequest::from_url(&url).unwrap();
 
         assert_eq!(request.source, Some(SourceFilter::Omp));
+    }
+
+    #[test]
+    fn search_request_accepts_jcode_and_muse_sources() {
+        let url_jcode = parse_url("/api/search?source=jcode").unwrap();
+        assert_eq!(
+            SearchRequest::from_url(&url_jcode).unwrap().source,
+            Some(SourceFilter::Jcode)
+        );
+        let url_muse = parse_url("/api/search?source=muse").unwrap();
+        assert_eq!(
+            SearchRequest::from_url(&url_muse).unwrap().source,
+            Some(SourceFilter::Muse)
+        );
     }
 
     #[test]

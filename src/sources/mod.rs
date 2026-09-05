@@ -12,6 +12,8 @@ pub mod copilot;
 pub mod cursor;
 pub mod grok;
 pub mod hermes;
+pub mod jcode;
+pub mod muse;
 pub mod omp;
 pub mod openclaw;
 pub mod opencode;
@@ -249,6 +251,8 @@ pub fn versions(source: SourceKind) -> ParserVersions {
         SourceKind::Copilot => copilot::VERSIONS,
         SourceKind::Grok => grok::VERSIONS,
         SourceKind::Hermes => hermes::VERSIONS,
+        SourceKind::Jcode => jcode::VERSIONS,
+        SourceKind::Muse => muse::VERSIONS,
     }
 }
 
@@ -266,6 +270,9 @@ pub fn index_state_version_for(source: SourceKind, include_reasoning: bool) -> u
                 | SourceKind::Pi
                 | SourceKind::Omp
                 | SourceKind::OpenClaw
+                | SourceKind::Opencode
+                | SourceKind::Jcode
+                | SourceKind::Muse
                 | SourceKind::Grok
         );
     (versions.identity.saturating_mul(10_000) + versions.index)
@@ -280,6 +287,12 @@ pub fn classify_path(path: &str) -> SourceKind {
         source
     } else if opencode::matches_path(path) {
         SourceKind::Opencode
+    } else if jcode::matches_path(path) {
+        SourceKind::Jcode
+    } else if muse::matches_path(path) {
+        SourceKind::Muse
+    } else if grok::matches_path(path) {
+        SourceKind::Grok
     } else if cursor::matches_path(path) {
         SourceKind::Cursor
     } else if omp::matches_path(path) {
@@ -290,8 +303,6 @@ pub fn classify_path(path: &str) -> SourceKind {
         SourceKind::OpenClaw
     } else if copilot::matches_path(path) {
         SourceKind::Copilot
-    } else if grok::matches_path(path) {
-        SourceKind::Grok
     } else if hermes::matches_path(path) {
         SourceKind::Hermes
     } else {
@@ -311,6 +322,10 @@ mod tests {
             SourceKind::Pi,
             SourceKind::Omp,
             SourceKind::OpenClaw,
+            SourceKind::Opencode,
+            SourceKind::Jcode,
+            SourceKind::Muse,
+            SourceKind::Grok,
         ] {
             assert_ne!(
                 index_state_version_for(source, false),

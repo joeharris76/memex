@@ -1019,6 +1019,16 @@ fn resolve_session_cwd_from_parts(
     {
         return Some(cwd);
     }
+    if source == SourceKind::Jcode
+        && let Some(cwd) = crate::sources::jcode::cwd_from_jcode_session(Path::new(source_path))
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
+    if source == SourceKind::Muse
+        && let Some(cwd) = crate::sources::muse::cwd_from_muse_session(Path::new(source_path))
+    {
+        return Some(cwd.to_string_lossy().to_string());
+    }
     let file = std::fs::File::open(source_path).ok()?;
     let reader = std::io::BufReader::new(file);
     let mut fallback: Option<String> = None;
@@ -1494,7 +1504,8 @@ mod tests {
         fs::write(
             &transcript,
             format!(
-                "{{\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                "{{\"cwd\":\"{}\",\"type\":\"session_meta\",\"payload\":{{\"cwd\":\"{}\"}}}}\n",
+                repo.display(),
                 repo.display()
             ),
         )

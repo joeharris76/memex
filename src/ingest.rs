@@ -41,6 +41,8 @@ pub struct IngestOptions {
     pub include_openclaw: bool,
     pub include_copilot: bool,
     pub include_grok: bool,
+    pub include_jcode: bool,
+    pub include_muse: bool,
     pub exclude_patterns: Vec<String>,
     pub embeddings: bool,
     pub backfill_embeddings: bool,
@@ -238,6 +240,13 @@ fn prepare_file_task(
             previous.pending_tool_calls.clone(),
             true,
         ),
+        // Jcode sessions are whole JSON documents, not appendable JSONL: any change
+        // must delete existing records and re-index from scratch, otherwise the
+        // parser (which replays the full messages array) would duplicate history.
+        Some(previous) if source == SourceKind::Jcode => {
+            let _ = previous;
+            (0, 0, true, HashMap::new(), false)
+        }
         Some(previous) => (
             previous.offset,
             previous.turn_id,
@@ -1217,6 +1226,66 @@ pub fn ingest_all(
         }
     }
 
+    if options.include_jcode {
+        let jcode_files = crate::sources::jcode::discover();
+        for source_file in jcode_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Jcode,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
+    if options.include_muse {
+        let muse_files = crate::sources::muse::discover();
+        for source_file in muse_files {
+            let path = source_file.path;
+            if excluder.is_excluded(&path) {
+                files_skipped += 1;
+                continue;
+            }
+            let Some(meta) = discovered_metadata(&path)? else {
+                files_skipped += 1;
+                continue;
+            };
+            files_scanned += 1;
+            total_bytes += meta.len();
+            let key = path.to_string_lossy().to_string();
+            let (task, skip) = prepare_file_task(
+                path,
+                SourceKind::Muse,
+                options.include_reasoning,
+                &meta,
+                state.files.get(&key),
+            );
+            if skip {
+                files_skipped += 1;
+                continue;
+            }
+            tasks.push(task);
+        }
+    }
+
     // Previously indexed records under now-excluded paths must be deleted even
     // when there is no ingest state entry for them (e.g. state loss or legacy runs).
     let mut excluded_index_paths: Vec<String> = Vec::new();
@@ -1506,6 +1575,22 @@ pub fn ingest_all(
                     &progress,
                 ),
                 SourceKind::Hermes => Err(anyhow!("Hermes indexing is not supported")),
+                SourceKind::Jcode => parse_jcode_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
+                SourceKind::Muse => parse_muse_file(
+                    task,
+                    options.include_reasoning,
+                    &tx_record,
+                    &tx_update,
+                    &next_doc_id,
+                    &progress,
+                ),
             };
             finish_file_task(task, &progress, &parse_skipped, result)
         })
@@ -2079,6 +2164,72 @@ fn parse_opencode_file(
     )
 }
 
+fn parse_jcode_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::jcode::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Jcode, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Jcode,
+        source_path,
+        parsed,
+    )
+}
+
+fn parse_muse_file(
+    task: &FileTask,
+    include_reasoning: bool,
+    tx_record: &RecordSender,
+    tx_update: &Sender<FileUpdate>,
+    next_doc_id: &AtomicU64,
+    progress: &Arc<Progress>,
+) -> Result<()> {
+    let source_path = task.path.to_string_lossy().to_string();
+    let parsed = crate::sources::muse::parse_index_records(
+        &task.path,
+        crate::sources::IndexParseState {
+            offset: task.offset,
+            turn_id: task.turn_id,
+            pending_tool_calls: task.pending_tool_calls.clone(),
+        },
+        include_reasoning,
+        next_doc_id,
+        |record| {
+            progress.add_produced(SourceKind::Muse, 1);
+            tx_record.send(record)
+        },
+    )?;
+    finish_source_parse(
+        task,
+        tx_update,
+        progress,
+        SourceKind::Muse,
+        source_path,
+        parsed,
+    )
+}
+
 fn parse_cursor_file(
     task: &FileTask,
     tx_record: &RecordSender,
@@ -2443,6 +2594,8 @@ mod tests {
             include_openclaw: false,
             include_copilot: false,
             include_grok: false,
+            include_jcode: false,
+            include_muse: false,
             embeddings,
             backfill_embeddings: false,
             model,
@@ -4201,6 +4354,39 @@ mod tests {
     }
 
     #[test]
+    fn jcode_append_forces_whole_file_replacement() {
+        use std::io::Write;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("session_test.json");
+        fs::write(&path, r#"{"id":"s1","messages":[]}"#).expect("write session");
+        let metadata = path.metadata().expect("session metadata");
+        let (first, _) = prepare_file_task(path.clone(), SourceKind::Jcode, false, &metadata, None);
+        let previous =
+            completed_file_state(&first, metadata.len(), 1, first.pending_tool_calls.clone());
+
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open append")
+            .write_all(br#", "appended": true}"#)
+            .expect("append");
+        let appended_metadata = path.metadata().expect("appended metadata");
+        let (appended, skip) = prepare_file_task(
+            path,
+            SourceKind::Jcode,
+            false,
+            &appended_metadata,
+            Some(&previous),
+        );
+
+        assert!(!skip);
+        assert!(appended.delete_first);
+        assert_eq!(appended.offset, 0);
+        assert!(appended.pending_tool_calls.is_empty());
+    }
+
+    #[test]
     fn index_parser_version_change_rebuilds_and_clears_pending_state() {
         let temp = tempfile::tempdir().expect("tempdir");
         let path = temp.path().join("session.jsonl");
@@ -4323,6 +4509,8 @@ mod tests {
             include_openclaw: false,
             include_copilot: false,
             include_grok: false,
+            include_jcode: false,
+            include_muse: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -4763,6 +4951,8 @@ mod tests {
             include_openclaw: false,
             include_copilot: false,
             include_grok: false,
+            include_jcode: false,
+            include_muse: false,
             embeddings: false,
             backfill_embeddings: false,
             model: ModelChoice::default(),
@@ -5105,11 +5295,11 @@ mod tests {
         let tx_record = RecordSender::new(raw_tx_record, IndexedToolContentLimits::default());
         let (tx_update, rx_update) = unbounded();
         let next_doc_id = AtomicU64::new(1);
-        let progress = Arc::new(Progress::new(
-            [0, 0, 0, 0, 0, 0, meta.len(), 0, 0, 0],
-            [0, 0, 0, 0, 0, 0, 1, 0, 0, 0],
-            false,
-        ));
+        let mut total_bytes = [0; SOURCE_COUNT];
+        total_bytes[SourceKind::Copilot.idx()] = meta.len();
+        let mut files_total = [0; SOURCE_COUNT];
+        files_total[SourceKind::Copilot.idx()] = 1;
+        let progress = Arc::new(Progress::new(total_bytes, files_total, false));
 
         parse_copilot_session(&task, &tx_record, &tx_update, &next_doc_id, &progress)
             .expect("parse copilot session");
