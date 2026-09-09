@@ -1329,13 +1329,13 @@ fn git_metadata_for_cwd(cwd: &str) -> GitMetadata {
     let fallback = worktree_repo_project(cwd);
     let path_repo_project =
         claude_worktree_repo_project(cwd).or_else(|| codex_worktree_repo_project(cwd));
-    let mut repo_project = common_dir
+    let git_repo_project = common_dir
         .as_deref()
         .and_then(common_dir_project_name)
-        .or_else(|| root.as_deref().and_then(path_file_name))
-        .or(path_repo_project);
+        .or_else(|| root.as_deref().and_then(path_file_name));
+    let mut repo_project = git_repo_project.clone().or(path_repo_project.clone());
 
-    let mut is_fallback = false;
+    let mut is_fallback = git_repo_project.is_none() && path_repo_project.is_some();
     if let Some(fb) = fallback
         && (common_dir.is_none() || repo_project.is_none())
     {
@@ -1932,11 +1932,15 @@ fn resolve_session_cwd_from_parts(
     opencode: &mut OpencodeLookupCache,
 ) -> Option<String> {
     if source == SourceKind::Opencode && crate::sources::opencode::is_database_path(source_path) {
-        return crate::sources::opencode::enumerate_sessions(Path::new(source_path))
-            .ok()?
-            .into_iter()
-            .find(|session| session.id == session_id)
-            .map(|session| session.directory);
+        if let Ok(sessions) = crate::sources::opencode::enumerate_sessions(Path::new(source_path))
+            && let Some(cwd) = sessions
+                .into_iter()
+                .find(|session| session.id == session_id)
+                .map(|session| session.directory)
+        {
+            return Some(cwd);
+        }
+        return opencode_cwd_for_session(source_path, session_id);
     }
     if source == SourceKind::Copilot
         && let Some(cwd) = resolve_copilot_workspace_cwd(source_path)
